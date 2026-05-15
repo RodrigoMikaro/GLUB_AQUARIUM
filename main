@@ -3,20 +3,26 @@
 #include <PubSubClient.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <Wire.h>
+#include <INA226_WE.h>
 #include "time.h"
+
+// --- CONFIGURAÇÕES DO SENSOR INA226 ---
+#define I2C_ADDRESS 0x40
+INA226_WE ina226 = INA226_WE(I2C_ADDRESS);
+const int PIN_SDA = 21; 
+const int PIN_SCL = 22; 
 
 // --- CONFIGURAÇÕES HIVEMQ ---
 const char* mqtt_server = "0e6bf66e693b43c2a87b5cd707fe5647.s1.eu.hivemq.cloud";
 const int mqtt_port    = 8883;
 const char* mqtt_user   = "glub1"; 
 const char* mqtt_pass   = "GlubAquarium1";
-const char* topic_led   = "glub1/led";
-const int ledPin        = 2;
+const char* topic_led      = "glub1/led";      // Para você ligar/desligar o LED
+const char* topic_voltagem = "glub1/voltagem"; // Para você monitorar a tensão
+const int ledPin           = 2;
 
-// --- CONFIGURAÇÕES PORTAL CAPTIVO ---
-const char* ssid_ap = "GLUB_1_WIFI";
-const char* pass_ap = "GLUB_1_WIFI";
-
+// --- VARIÁVEIS GERAIS ---
 WebServer server(80);
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
@@ -24,10 +30,13 @@ Preferences preferences;
 
 String rede_local = "";
 String senha_local = "";
+float voltagem = 0.0;
+
 unsigned long anteriorMillisMQTT = 0;
 unsigned long anteriorMillisWiFi = 0;
+unsigned long anteriorMillisPublicacao = 0;
 
-// --- FUNÇÕES DO PORTAL DE CONFIGURAÇÃO ---
+// --- FUNÇÕES DE CONEXÃO E PORTAL (MANTIDAS) ---
 void handleRoot() {
   String html = "<html><body style='text-align:center; font-family:sans-serif;'>";
   html += "<h2>Configurar Wi-Fi - GLUB</h2><form action='/save' method='POST'>";
@@ -42,53 +51,56 @@ void handleSave() {
   preferences.putString("ssid", server.arg("ssid"));
   preferences.putString("pass", server.arg("pass"));
   preferences.end();
-  server.send(200, "text/html", "Configuracoes salvas! O dispositivo ira reiniciar...");
+  server.send(200, "text/html", "Configurações salvas! Reiniciando...");
   delay(2000);
   ESP.restart();
 }
 
-// --- SINCRONIZAÇÃO DE HORA (OBRIGATÓRIO PARA SSL/TLS) ---
 void sincronizarHora() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  Serial.print("Sincronizando hora para TLS...");
   time_t now = time(nullptr);
   int tentativas = 0;
   while (now < 8 * 3600 * 2 && tentativas < 20) {
     delay(500);
-    Serial.print(".");
     now = time(nullptr);
     tentativas++;
   }
-  Serial.println("\nHora sincronizada!");
 }
 
-// --- GESTÃO DE CONEXÕES (WI-FI E MQTT) ---
 void manterConexoes() {
-  // 1. Verifica Wi-Fi
   if (WiFi.status() != WL_CONNECTED) {
     if (millis() - anteriorMillisWiFi >= 10000) {
-      Serial.println("Wi-Fi offline. Tentando reconectar...");
       WiFi.begin(rede_local.c_str(), senha_local.c_str());
       anteriorMillisWiFi = millis();
     }
-    return; // Se não tem Wi-Fi, não tenta MQTT
+    return;
   }
 
-  // 2. Verifica MQTT
   if (!client.connected()) {
     if (millis() - anteriorMillisMQTT >= 10000) {
-      Serial.print("Tentando conectar ao HiveMQ...");
-      
-      // Criar um ID de cliente único
       String clientId = "ESP32_GLUB_" + String(random(0xffff), HEX);
-      
       if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-        Serial.println(" CONECTADO!");
         client.subscribe(topic_led);
-      } else {
-        Serial.printf(" FALHA rc=%d\n", client.state());
+        Serial.println("MQTT Conectado!");
       }
       anteriorMillisMQTT = millis();
+    }
+  }
+}
+
+// --- NOVA LÓGICA: SENSOR APENAS ENVIA DADOS ---
+void tratarSensor() {
+  // Lê a voltagem independente da fonte (bateria ou tomada)
+  voltagem = ina226.getBusVoltage_V();
+
+  // Publica no MQTT a cada 1 segundo para monitoramento remoto
+  if (millis() - anteriorMillisPublicacao >= 1000) {
+    anteriorMillisPublicacao = millis();
+    if (client.connected()) {
+      char msgBuffer[10];
+      dtostrf(voltagem, 4, 2, msgBuffer);
+      client.publish(topic_voltagem, msgBuffer);
+      Serial.printf("Voltagem enviada: %s V\n", msgBuffer);
     }
   }
 }
@@ -97,72 +109,66 @@ void setup() {
   pinMode(ledPin, OUTPUT);
   Serial.begin(115200);
 
-  // Configurações de persistência do Wi-Fi
+  // Inicializa o sensor
+  Wire.begin(PIN_SDA, PIN_SCL);
+  if (ina226.init()) {
+    ina226.setAverage(INA226_AVERAGE_16);           
+    ina226.setConversionTime(INA226_CONV_TIME_1100); 
+    Serial.println("INA226 pronto.");
+  }
+
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 
-  // Recupera credenciais da memória flash
   preferences.begin("wifi-config", true);
   rede_local = preferences.getString("ssid", "");
   senha_local = preferences.getString("pass", "");
   preferences.end();
 
-  // Tenta conectar ao Wi-Fi salvo
   if (rede_local != "") {
-    Serial.println("Conectando ao Wi-Fi: " + rede_local);
     WiFi.begin(rede_local.c_str(), senha_local.c_str());
     int count = 0;
-    while (WiFi.status() != WL_CONNECTED && count < 20) {
-      delay(500);
-      Serial.print(".");
-      count++;
-    }
+    while (WiFi.status() != WL_CONNECTED && count < 20) { delay(500); count++; }
   }
 
-  // Se não conectou, abre o Portal de Configuração
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\nWi-Fi nao encontrado. Iniciando Access Point...");
-    WiFi.softAP(ssid_ap, pass_ap);
+    WiFi.softAP("GLUB_1_WIFI", "GLUB_1_WIFI");
     server.on("/", handleRoot);
     server.on("/save", HTTP_POST, handleSave);
     server.begin();
-    
     while (WiFi.status() != WL_CONNECTED) {
       server.handleClient();
-      // LED pisca rápido indicando modo configuração
-      digitalWrite(ledPin, (millis() / 200) % 2 == 0);
+      digitalWrite(ledPin, (millis() / 500) % 2 == 0); // Pisca lento no modo AP
     }
     server.stop();
     WiFi.softAPdisconnect(true);
   }
 
-  Serial.println("\nWi-Fi Conectado com sucesso!");
-
-  // Configurações de Segurança para HiveMQ Cloud
   sincronizarHora();
-  espClient.setInsecure(); // Permite conexão sem validar o certificado raiz (ideal para ESP32)
-  
-  client.setBufferSize(2048); // Buffer maior para pacotes TLS
+  espClient.setInsecure();
+  client.setBufferSize(2048);
   client.setServer(mqtt_server, mqtt_port);
   
-  // Callback para receber mensagens
+  // --- CALLBACK: LED OBEDECE APENAS AO MQTT ---
   client.setCallback([](char* topic, byte* payload, unsigned int length) {
-    Serial.print("Mensagem recebida [");
-    Serial.print(topic);
-    Serial.print("]: ");
-    
     String msg;
     for (int i = 0; i < length; i++) msg += (char)payload[i];
+    
+    Serial.print("Comando LED recebido: ");
     Serial.println(msg);
 
-    if (msg == "1") digitalWrite(ledPin, HIGH);
-    else if (msg == "0") digitalWrite(ledPin, LOW);
+    if (msg == "1") {
+      digitalWrite(ledPin, HIGH); // Liga
+    } 
+    else if (msg == "0") {
+      digitalWrite(ledPin, LOW);  // Desliga
+    }
   });
 }
 
 void loop() {
   manterConexoes();
-  
+  tratarSensor(); // Lê e envia a voltagem a cada 1s
   if (client.connected()) {
     client.loop();
   }
