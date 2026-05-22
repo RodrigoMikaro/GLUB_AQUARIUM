@@ -7,169 +7,669 @@
 #include <INA226_WE.h>
 #include "time.h"
 
-// --- CONFIGURAÇÕES DO SENSOR INA226 ---
+// ======================================================
+// INA226
+// ======================================================
 #define I2C_ADDRESS 0x40
 INA226_WE ina226 = INA226_WE(I2C_ADDRESS);
-const int PIN_SDA = 21; 
-const int PIN_SCL = 22; 
 
-// --- CONFIGURAÇÕES HIVEMQ ---
+const int PIN_SDA = 21;
+const int PIN_SCL = 22;
+
+// ======================================================
+// MQTT
+// ======================================================
 const char* mqtt_server = "0e6bf66e693b43c2a87b5cd707fe5647.s1.eu.hivemq.cloud";
-const int mqtt_port    = 8883;
-const char* mqtt_user   = "glub1"; 
-const char* mqtt_pass   = "GlubAquarium1";
-const char* topic_led      = "glub1/led";      // Para você ligar/desligar o LED
-const char* topic_voltagem = "glub1/voltagem"; // Para você monitorar a tensão
-const int ledPin           = 2;
+const int mqtt_port = 8883;
 
-// --- VARIÁVEIS GERAIS ---
-WebServer server(80);
-WiFiClientSecure espClient;
-PubSubClient client(espClient);
-Preferences preferences; 
+const char* mqtt_user = "glub1";
+const char* mqtt_pass = "GlubAquarium1";
 
-String rede_local = "";
-String senha_local = "";
-float voltagem = 0.0;
+const char* topic_led       = "glub1/led";
+const char* topic_voltagem  = "glub1/voltagem";
+const char* topic_troca     = "glub1/troca";
+const char* topic_status    = "glub1/troca/status";
+const char* topic_distancia = "glub1/distancia";
 
+// ======================================================
+// PINOS
+// ======================================================
+const int ledPin = 2;
+
+const int BOMBA_ENCHER   = 32;
+const int BOMBA_ESVAZIAR = 33;
+
+const int TRIG_PIN = 25;
+const int ECHO_PIN = 26;
+
+// ======================================================
+// SENSOR ULTRASSÔNICO
+// ======================================================
+const float TEMP_C = 20.0;
+float distancia_Per_uSec;
+
+const int NUM_LEITURAS = 10;
+
+float leituras[NUM_LEITURAS];
+float soma = 0;
+
+int indice = 0;
+int leiturasValidas = 0;
+
+float distanciaCm = 0;
+float distanciaMediaCm = 0;
+
+// SENSOR A 36cm DO FUNDO
+// PARAR EM 28cm
+const float DISTANCIA_MAX_RESERVATORIO_SUJO_CM = 28.0;
+
+// ======================================================
+// TEMPOS
+// ======================================================
 unsigned long anteriorMillisMQTT = 0;
 unsigned long anteriorMillisWiFi = 0;
 unsigned long anteriorMillisPublicacao = 0;
+unsigned long anteriorMillisUltrassom = 0;
 
-// --- FUNÇÕES DE CONEXÃO E PORTAL (MANTIDAS) ---
+const unsigned long intervaloUltrassom = 100;
+
+// segurança
+const unsigned long TEMPO_MAX_DRENAGEM = 180000;
+const unsigned long TEMPO_MAX_ENCHIMENTO = 180000;
+
+// ======================================================
+// VARIÁVEIS
+// ======================================================
+WebServer server(80);
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+Preferences preferences;
+
+String rede_local = "";
+String senha_local = "";
+
+float voltagem = 0.0;
+
+unsigned long tempoTrocaAprendido = 0;
+
+// ======================================================
+// ESTADOS
+// ======================================================
+enum EstadoTroca {
+  IDLE,
+  DRENANDO,
+  ENCHENDO
+};
+
+EstadoTroca estadoTroca = IDLE;
+
+bool trocaAtiva = false;
+
+unsigned long inicioEtapa = 0;
+
+// ======================================================
+// PORTAL WIFI
+// ======================================================
 void handleRoot() {
-  String html = "<html><body style='text-align:center; font-family:sans-serif;'>";
-  html += "<h2>Configurar Wi-Fi - GLUB</h2><form action='/save' method='POST'>";
+
+  String html;
+
+  html += "<html><body style='text-align:center;font-family:sans-serif;'>";
+  html += "<h2>Configurar WiFi - GLUB</h2>";
+  html += "<form action='/save' method='POST'>";
   html += "Rede: <input type='text' name='ssid'><br><br>";
   html += "Senha: <input type='password' name='pass'><br><br>";
-  html += "<input type='submit' value='Salvar'></form></body></html>";
+  html += "<input type='submit' value='Salvar'>";
+  html += "</form></body></html>";
+
   server.send(200, "text/html", html);
 }
 
 void handleSave() {
+
   preferences.begin("wifi-config", false);
+
   preferences.putString("ssid", server.arg("ssid"));
   preferences.putString("pass", server.arg("pass"));
+
   preferences.end();
-  server.send(200, "text/html", "Configurações salvas! Reiniciando...");
+
+  server.send(200, "text/html", "Salvo! Reiniciando...");
+
   delay(2000);
+
   ESP.restart();
 }
 
+// ======================================================
+// NTP
+// ======================================================
 void sincronizarHora() {
+
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
   time_t now = time(nullptr);
+
   int tentativas = 0;
+
   while (now < 8 * 3600 * 2 && tentativas < 20) {
+
     delay(500);
+
     now = time(nullptr);
+
     tentativas++;
   }
 }
 
-void manterConexoes() {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - anteriorMillisWiFi >= 10000) {
-      WiFi.begin(rede_local.c_str(), senha_local.c_str());
-      anteriorMillisWiFi = millis();
-    }
+// ======================================================
+// BOMBAS
+// ======================================================
+// MUDE PARA LOW/HIGH CASO O RELÉ SEJA ATIVO EM LOW
+
+const int RELE_ON  = HIGH;
+const int RELE_OFF = LOW;
+
+void desligarBombas() {
+
+  digitalWrite(BOMBA_ENCHER, RELE_OFF);
+  digitalWrite(BOMBA_ESVAZIAR, RELE_OFF);
+}
+
+void ligarBombaEncher() {
+
+  digitalWrite(BOMBA_ESVAZIAR, RELE_OFF);
+  digitalWrite(BOMBA_ENCHER, RELE_ON);
+}
+
+void ligarBombaEsvaziar() {
+
+  digitalWrite(BOMBA_ENCHER, RELE_OFF);
+  digitalWrite(BOMBA_ESVAZIAR, RELE_ON);
+}
+
+// ======================================================
+// MQTT STATUS
+// ======================================================
+void publicarStatus(const char* msg) {
+
+  if(client.connected()) {
+
+    client.publish(topic_status, msg, true);
+  }
+}
+
+// ======================================================
+// ULTRASSÔNICO
+// ======================================================
+void atualizarUltrassom() {
+
+  if(millis() - anteriorMillisUltrassom < intervaloUltrassom) {
     return;
   }
 
-  if (!client.connected()) {
-    if (millis() - anteriorMillisMQTT >= 10000) {
-      String clientId = "ESP32_GLUB_" + String(random(0xffff), HEX);
-      if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-        client.subscribe(topic_led);
-        Serial.println("MQTT Conectado!");
+  anteriorMillisUltrassom = millis();
+
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(15);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if(duration > 0 && duration < 25000) {
+
+    distanciaCm = (duration / 2.0) * distancia_Per_uSec;
+
+    if(leiturasValidas < NUM_LEITURAS) {
+
+      leituras[indice] = distanciaCm;
+
+      soma += distanciaCm;
+
+      leiturasValidas++;
+    }
+    else {
+
+      soma -= leituras[indice];
+
+      leituras[indice] = distanciaCm;
+
+      soma += distanciaCm;
+    }
+
+    indice = (indice + 1) % NUM_LEITURAS;
+
+    distanciaMediaCm = soma / leiturasValidas;
+
+    Serial.print("Distancia: ");
+    Serial.print(distanciaCm, 1);
+
+    Serial.print(" cm | Media: ");
+    Serial.print(distanciaMediaCm, 1);
+
+    Serial.println(" cm");
+
+    if(client.connected()) {
+
+      char buffer[10];
+
+      dtostrf(distanciaMediaCm, 4, 1, buffer);
+
+      client.publish(topic_distancia, buffer);
+    }
+  }
+}
+
+// ======================================================
+// TROCA DE ÁGUA
+// ======================================================
+void iniciarTrocaAgua() {
+
+  if(trocaAtiva) return;
+
+  trocaAtiva = true;
+
+  estadoTroca = DRENANDO;
+
+  inicioEtapa = millis();
+
+  ligarBombaEsvaziar();
+
+  publicarStatus("drenando");
+
+  Serial.println("Iniciando drenagem...");
+}
+
+void finalizarTroca() {
+
+  desligarBombas();
+
+  estadoTroca = IDLE;
+
+  trocaAtiva = false;
+
+  publicarStatus("concluido");
+
+  Serial.println("Troca concluida.");
+}
+
+void atualizarTrocaAgua() {
+
+  if(!trocaAtiva) return;
+
+  unsigned long agora = millis();
+
+  // =============================
+  // DRENAGEM
+  // =============================
+  if(estadoTroca == DRENANDO) {
+
+    bool atingiuNivel =
+    (
+      distanciaMediaCm >= 24.0 &&
+      distanciaMediaCm <= 28.0
+    );
+
+    bool timeout =
+    (
+      agora - inicioEtapa >= TEMPO_MAX_DRENAGEM
+    );
+
+    if(atingiuNivel || timeout) {
+
+      unsigned long tempoDrenagem =
+      agora - inicioEtapa;
+
+      if(atingiuNivel) {
+
+        tempoTrocaAprendido = tempoDrenagem;
+
+        preferences.begin("troca", false);
+
+        preferences.putULong(
+          "tempo",
+          tempoTrocaAprendido
+        );
+
+        preferences.end();
+
+        Serial.print("Tempo aprendido salvo: ");
+        Serial.println(tempoTrocaAprendido);
       }
+
+      desligarBombas();
+
+      ligarBombaEncher();
+
+      estadoTroca = ENCHENDO;
+
+      inicioEtapa = millis();
+
+      publicarStatus("enchendo");
+
+      Serial.println("Enchendo aquario...");
+    }
+  }
+
+  // =============================
+  // ENCHIMENTO
+  // =============================
+  else if(estadoTroca == ENCHENDO) {
+
+    unsigned long tempoUsado;
+
+    if(tempoTrocaAprendido > 0) {
+      tempoUsado = tempoTrocaAprendido;
+    }
+    else {
+      tempoUsado = 30000;
+    }
+
+    bool terminou =
+    (
+      agora - inicioEtapa >= tempoUsado
+    );
+
+    bool timeout =
+    (
+      agora - inicioEtapa >= TEMPO_MAX_ENCHIMENTO
+    );
+
+    if(terminou || timeout) {
+
+      finalizarTroca();
+    }
+  }
+}
+
+// ======================================================
+// CONEXÕES
+// ======================================================
+void manterConexoes() {
+
+  // WIFI
+  if(WiFi.status() != WL_CONNECTED) {
+
+    if(millis() - anteriorMillisWiFi >= 10000) {
+
+      WiFi.begin(
+        rede_local.c_str(),
+        senha_local.c_str()
+      );
+
+      anteriorMillisWiFi = millis();
+    }
+
+    return;
+  }
+
+  // MQTT
+  if(!client.connected()) {
+
+    if(millis() - anteriorMillisMQTT >= 10000) {
+
+      String clientId =
+      "ESP32_GLUB_" +
+      String(random(0xffff), HEX);
+
+      if(client.connect(
+        clientId.c_str(),
+        mqtt_user,
+        mqtt_pass
+      )) {
+
+        client.subscribe(topic_led);
+        client.subscribe(topic_troca);
+
+        Serial.println("MQTT conectado!");
+      }
+      else {
+
+        Serial.print("Falha MQTT: ");
+        Serial.println(client.state());
+      }
+
       anteriorMillisMQTT = millis();
     }
   }
 }
 
-// --- NOVA LÓGICA: SENSOR APENAS ENVIA DADOS ---
-void tratarSensor() {
-  // Lê a voltagem independente da fonte (bateria ou tomada)
+// ======================================================
+// INA226
+// ======================================================
+void tratarSensorINA226() {
+
   voltagem = ina226.getBusVoltage_V();
 
-  // Publica no MQTT a cada 1 segundo para monitoramento remoto
-  if (millis() - anteriorMillisPublicacao >= 1000) {
+  if(millis() - anteriorMillisPublicacao >= 1000) {
+
     anteriorMillisPublicacao = millis();
-    if (client.connected()) {
+
+    if(client.connected()) {
+
       char msgBuffer[10];
+
       dtostrf(voltagem, 4, 2, msgBuffer);
+
       client.publish(topic_voltagem, msgBuffer);
-      Serial.printf("Voltagem enviada: %s V\n", msgBuffer);
+
+      Serial.print("Voltagem: ");
+      Serial.println(msgBuffer);
     }
   }
 }
 
-void setup() {
-  pinMode(ledPin, OUTPUT);
-  Serial.begin(115200);
+// ======================================================
+// CALLBACK MQTT
+// ======================================================
+void callback(
+  char* topic,
+  byte* payload,
+  unsigned int length
+) {
 
-  // Inicializa o sensor
-  Wire.begin(PIN_SDA, PIN_SCL);
-  if (ina226.init()) {
-    ina226.setAverage(INA226_AVERAGE_16);           
-    ina226.setConversionTime(INA226_CONV_TIME_1100); 
-    Serial.println("INA226 pronto.");
+  String msg;
+
+  for(int i = 0; i < length; i++) {
+
+    msg += (char)payload[i];
   }
 
+  Serial.print("MQTT [");
+  Serial.print(topic);
+  Serial.print("] => ");
+  Serial.println(msg);
+
+  // LED
+  if(strcmp(topic, topic_led) == 0) {
+
+    if(msg == "1") {
+      digitalWrite(ledPin, HIGH);
+    }
+
+    else if(msg == "0") {
+      digitalWrite(ledPin, LOW);
+    }
+  }
+
+  // TROCA DE ÁGUA
+  if(strcmp(topic, topic_troca) == 0) {
+
+    if(msg == "1") {
+
+      iniciarTrocaAgua();
+    }
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+void setup() {
+
+  Serial.begin(115200);
+
+  // PINOS
+  pinMode(ledPin, OUTPUT);
+
+  pinMode(BOMBA_ENCHER, OUTPUT);
+  pinMode(BOMBA_ESVAZIAR, OUTPUT);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  digitalWrite(TRIG_PIN, LOW);
+
+  desligarBombas();
+
+  // VELOCIDADE SOM
+  float speed_Of_Sound =
+  331.1 + (0.606 * TEMP_C);
+
+  distancia_Per_uSec =
+  speed_Of_Sound / 10000.0;
+
+  // LIMPA BUFFER
+  for(int i = 0; i < NUM_LEITURAS; i++) {
+    leituras[i] = 0;
+  }
+
+  // INA226
+  Wire.begin(PIN_SDA, PIN_SCL);
+
+  if(ina226.init()) {
+
+    ina226.setAverage(
+      INA226_AVERAGE_16
+    );
+
+    ina226.setConversionTime(
+      INA226_CONV_TIME_1100
+    );
+
+    Serial.println("INA226 pronto.");
+  }
+  else {
+
+    Serial.println("Falha INA226.");
+  }
+
+  // WIFI SALVO
+  preferences.begin("wifi-config", true);
+
+  rede_local =
+  preferences.getString("ssid", "");
+
+  senha_local =
+  preferences.getString("pass", "");
+
+  preferences.end();
+
+  // TEMPO APRENDIDO
+  preferences.begin("troca", true);
+
+  tempoTrocaAprendido =
+  preferences.getULong("tempo", 0);
+
+  preferences.end();
+
+  Serial.print("Tempo salvo: ");
+  Serial.println(tempoTrocaAprendido);
+
+  // WIFI
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 
-  preferences.begin("wifi-config", true);
-  rede_local = preferences.getString("ssid", "");
-  senha_local = preferences.getString("pass", "");
-  preferences.end();
+  if(rede_local != "") {
 
-  if (rede_local != "") {
-    WiFi.begin(rede_local.c_str(), senha_local.c_str());
+    WiFi.begin(
+      rede_local.c_str(),
+      senha_local.c_str()
+    );
+
     int count = 0;
-    while (WiFi.status() != WL_CONNECTED && count < 20) { delay(500); count++; }
+
+    while(
+      WiFi.status() != WL_CONNECTED &&
+      count < 20
+    ) {
+
+      delay(500);
+
+      count++;
+    }
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.softAP("GLUB_1_WIFI", "GLUB_1_WIFI");
+  // PORTAL
+  if(WiFi.status() != WL_CONNECTED) {
+
+    WiFi.softAP(
+      "GLUB_1_WIFI",
+      "GLUB_1_WIFI"
+    );
+
     server.on("/", handleRoot);
-    server.on("/save", HTTP_POST, handleSave);
+
+    server.on(
+      "/save",
+      HTTP_POST,
+      handleSave
+    );
+
     server.begin();
-    while (WiFi.status() != WL_CONNECTED) {
+
+    while(WiFi.status() != WL_CONNECTED) {
+
       server.handleClient();
-      digitalWrite(ledPin, (millis() / 500) % 2 == 0); // Pisca lento no modo AP
+
+      digitalWrite(
+        ledPin,
+        (millis() / 500) % 2
+      );
     }
+
     server.stop();
+
     WiFi.softAPdisconnect(true);
   }
 
   sincronizarHora();
-  espClient.setInsecure();
-  client.setBufferSize(2048);
-  client.setServer(mqtt_server, mqtt_port);
-  
-  // --- CALLBACK: LED OBEDECE APENAS AO MQTT ---
-  client.setCallback([](char* topic, byte* payload, unsigned int length) {
-    String msg;
-    for (int i = 0; i < length; i++) msg += (char)payload[i];
-    
-    Serial.print("Comando LED recebido: ");
-    Serial.println(msg);
 
-    if (msg == "1") {
-      digitalWrite(ledPin, HIGH); // Liga
-    } 
-    else if (msg == "0") {
-      digitalWrite(ledPin, LOW);  // Desliga
-    }
-  });
+  // MQTT
+  espClient.setInsecure();
+
+  client.setBufferSize(2048);
+
+  client.setServer(
+    mqtt_server,
+    mqtt_port
+  );
+
+  client.setCallback(callback);
+
+  Serial.println("Sistema iniciado.");
 }
 
+// ======================================================
+// LOOP
+// ======================================================
 void loop() {
+
   manterConexoes();
-  tratarSensor(); // Lê e envia a voltagem a cada 1s
-  if (client.connected()) {
+
+  if(client.connected()) {
     client.loop();
   }
+
+  atualizarUltrassom();
+
+  tratarSensorINA226();
+
+  atualizarTrocaAgua();
 }
