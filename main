@@ -11,6 +11,7 @@
 // INA226
 // ======================================================
 #define I2C_ADDRESS 0x40
+
 INA226_WE ina226 = INA226_WE(I2C_ADDRESS);
 
 const int PIN_SDA = 21;
@@ -25,11 +26,11 @@ const int mqtt_port = 8883;
 const char* mqtt_user = "glub1";
 const char* mqtt_pass = "GlubAquarium1";
 
-const char* topic_led       = "glub1/led";
-const char* topic_voltagem  = "glub1/voltagem";
-const char* topic_troca     = "glub1/troca";
-const char* topic_status    = "glub1/troca/status";
-const char* topic_distancia = "glub1/distancia";
+const char* topic_led        = "glub1/led";
+const char* topic_voltagem   = "glub1/voltagem";
+const char* topic_troca      = "glub1/troca";
+const char* topic_status     = "glub1/troca/status";
+const char* topic_distancia  = "glub1/distancia";
 
 // ======================================================
 // PINOS
@@ -43,14 +44,16 @@ const int TRIG_PIN = 25;
 const int ECHO_PIN = 26;
 
 // ======================================================
-// SENSOR ULTRASSÔNICO
+// ULTRASSÔNICO
 // ======================================================
 const float TEMP_C = 20.0;
+
 float distancia_Per_uSec;
 
 const int NUM_LEITURAS = 10;
 
 float leituras[NUM_LEITURAS];
+
 float soma = 0;
 
 int indice = 0;
@@ -59,8 +62,8 @@ int leiturasValidas = 0;
 float distanciaCm = 0;
 float distanciaMediaCm = 0;
 
-// SENSOR A 36cm DO FUNDO
-// PARAR EM 28cm
+// sensor a 36cm do fundo
+// parar em ~28cm
 const float DISTANCIA_MAX_RESERVATORIO_SUJO_CM = 28.0;
 
 // ======================================================
@@ -68,13 +71,15 @@ const float DISTANCIA_MAX_RESERVATORIO_SUJO_CM = 28.0;
 // ======================================================
 unsigned long anteriorMillisMQTT = 0;
 unsigned long anteriorMillisWiFi = 0;
-unsigned long anteriorMillisPublicacao = 0;
+
 unsigned long anteriorMillisUltrassom = 0;
+unsigned long anteriorMillisTelemetria = 0;
 
 const unsigned long intervaloUltrassom = 100;
+const unsigned long intervaloTelemetria = 1000;
 
 // segurança
-const unsigned long TEMPO_MAX_DRENAGEM = 180000;
+const unsigned long TEMPO_MAX_DRENAGEM   = 180000;
 const unsigned long TEMPO_MAX_ENCHIMENTO = 180000;
 
 // ======================================================
@@ -83,6 +88,7 @@ const unsigned long TEMPO_MAX_ENCHIMENTO = 180000;
 WebServer server(80);
 
 WiFiClientSecure espClient;
+
 PubSubClient client(espClient);
 
 Preferences preferences;
@@ -154,7 +160,7 @@ void sincronizarHora() {
 
   int tentativas = 0;
 
-  while (now < 8 * 3600 * 2 && tentativas < 20) {
+  while(now < 8 * 3600 * 2 && tentativas < 20) {
 
     delay(500);
 
@@ -165,13 +171,16 @@ void sincronizarHora() {
 }
 
 // ======================================================
-// BOMBAS
+// RELÉS
 // ======================================================
-// MUDE PARA LOW/HIGH CASO O RELÉ SEJA ATIVO EM LOW
+// MUDE AQUI CASO SEU RELÉ SEJA ATIVO EM LOW
 
 const int RELE_ON  = HIGH;
 const int RELE_OFF = LOW;
 
+// ======================================================
+// BOMBAS
+// ======================================================
 void desligarBombas() {
 
   digitalWrite(BOMBA_ENCHER, RELE_OFF);
@@ -181,12 +190,14 @@ void desligarBombas() {
 void ligarBombaEncher() {
 
   digitalWrite(BOMBA_ESVAZIAR, RELE_OFF);
+
   digitalWrite(BOMBA_ENCHER, RELE_ON);
 }
 
 void ligarBombaEsvaziar() {
 
   digitalWrite(BOMBA_ENCHER, RELE_OFF);
+
   digitalWrite(BOMBA_ESVAZIAR, RELE_ON);
 }
 
@@ -213,14 +224,17 @@ void atualizarUltrassom() {
   anteriorMillisUltrassom = millis();
 
   digitalWrite(TRIG_PIN, LOW);
+
   delayMicroseconds(2);
 
   digitalWrite(TRIG_PIN, HIGH);
+
   delayMicroseconds(15);
 
   digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  // timeout reduzido
+  long duration = pulseIn(ECHO_PIN, HIGH, 15000);
 
   if(duration > 0 && duration < 25000) {
 
@@ -247,23 +261,75 @@ void atualizarUltrassom() {
 
     distanciaMediaCm = soma / leiturasValidas;
 
-    Serial.print("Distancia: ");
+    Serial.print("Dist: ");
     Serial.print(distanciaCm, 1);
 
     Serial.print(" cm | Media: ");
     Serial.print(distanciaMediaCm, 1);
 
     Serial.println(" cm");
-
-    if(client.connected()) {
-
-      char buffer[10];
-
-      dtostrf(distanciaMediaCm, 4, 1, buffer);
-
-      client.publish(topic_distancia, buffer);
-    }
   }
+}
+
+// ======================================================
+// INA226
+// ======================================================
+void tratarSensorINA226() {
+
+  voltagem = ina226.getBusVoltage_V();
+}
+
+// ======================================================
+// TELEMETRIA MQTT
+// ======================================================
+void publicarTelemetriaMQTT() {
+
+  if(millis() - anteriorMillisTelemetria < intervaloTelemetria) {
+    return;
+  }
+
+  anteriorMillisTelemetria = millis();
+
+  if(!client.connected()) {
+    return;
+  }
+
+  // =========================
+  // VOLTAGEM
+  // =========================
+  char bufferVolt[10];
+
+  dtostrf(voltagem, 4, 2, bufferVolt);
+
+  client.publish(
+    topic_voltagem,
+    bufferVolt,
+    true
+  );
+
+  // =========================
+  // DISTÂNCIA
+  // =========================
+  char bufferDist[10];
+
+  dtostrf(
+    distanciaMediaCm,
+    4,
+    1,
+    bufferDist
+  );
+
+  client.publish(
+    topic_distancia,
+    bufferDist,
+    true
+  );
+
+  Serial.print("MQTT -> Volt: ");
+  Serial.print(bufferVolt);
+
+  Serial.print(" | Dist: ");
+  Serial.println(bufferDist);
 }
 
 // ======================================================
@@ -305,9 +371,9 @@ void atualizarTrocaAgua() {
 
   unsigned long agora = millis();
 
-  // =============================
-  // DRENAGEM
-  // =============================
+  // ==================================================
+  // DRENANDO
+  // ==================================================
   if(estadoTroca == DRENANDO) {
 
     bool atingiuNivel =
@@ -340,6 +406,7 @@ void atualizarTrocaAgua() {
         preferences.end();
 
         Serial.print("Tempo aprendido salvo: ");
+
         Serial.println(tempoTrocaAprendido);
       }
 
@@ -357,9 +424,9 @@ void atualizarTrocaAgua() {
     }
   }
 
-  // =============================
-  // ENCHIMENTO
-  // =============================
+  // ==================================================
+  // ENCHENDO
+  // ==================================================
   else if(estadoTroca == ENCHENDO) {
 
     unsigned long tempoUsado;
@@ -425,6 +492,7 @@ void manterConexoes() {
       )) {
 
         client.subscribe(topic_led);
+
         client.subscribe(topic_troca);
 
         Serial.println("MQTT conectado!");
@@ -432,35 +500,11 @@ void manterConexoes() {
       else {
 
         Serial.print("Falha MQTT: ");
+
         Serial.println(client.state());
       }
 
       anteriorMillisMQTT = millis();
-    }
-  }
-}
-
-// ======================================================
-// INA226
-// ======================================================
-void tratarSensorINA226() {
-
-  voltagem = ina226.getBusVoltage_V();
-
-  if(millis() - anteriorMillisPublicacao >= 1000) {
-
-    anteriorMillisPublicacao = millis();
-
-    if(client.connected()) {
-
-      char msgBuffer[10];
-
-      dtostrf(voltagem, 4, 2, msgBuffer);
-
-      client.publish(topic_voltagem, msgBuffer);
-
-      Serial.print("Voltagem: ");
-      Serial.println(msgBuffer);
     }
   }
 }
@@ -482,8 +526,11 @@ void callback(
   }
 
   Serial.print("MQTT [");
+
   Serial.print(topic);
+
   Serial.print("] => ");
+
   Serial.println(msg);
 
   // LED
@@ -492,7 +539,6 @@ void callback(
     if(msg == "1") {
       digitalWrite(ledPin, HIGH);
     }
-
     else if(msg == "0") {
       digitalWrite(ledPin, LOW);
     }
@@ -522,6 +568,7 @@ void setup() {
   pinMode(BOMBA_ESVAZIAR, OUTPUT);
 
   pinMode(TRIG_PIN, OUTPUT);
+
   pinMode(ECHO_PIN, INPUT);
 
   digitalWrite(TRIG_PIN, LOW);
@@ -535,8 +582,9 @@ void setup() {
   distancia_Per_uSec =
   speed_Of_Sound / 10000.0;
 
-  // LIMPA BUFFER
+  // BUFFER
   for(int i = 0; i < NUM_LEITURAS; i++) {
+
     leituras[i] = 0;
   }
 
@@ -580,10 +628,12 @@ void setup() {
   preferences.end();
 
   Serial.print("Tempo salvo: ");
+
   Serial.println(tempoTrocaAprendido);
 
   // WIFI
   WiFi.setAutoReconnect(true);
+
   WiFi.persistent(true);
 
   if(rede_local != "") {
@@ -606,7 +656,7 @@ void setup() {
     }
   }
 
-  // PORTAL
+  // PORTAL AP
   if(WiFi.status() != WL_CONNECTED) {
 
     WiFi.softAP(
@@ -664,12 +714,19 @@ void loop() {
   manterConexoes();
 
   if(client.connected()) {
+
     client.loop();
   }
 
+  // rápido
   atualizarUltrassom();
 
+  // rápido
   tratarSensorINA226();
 
+  // rápido
   atualizarTrocaAgua();
+
+  // lento (1 segundo)
+  publicarTelemetriaMQTT();
 }
