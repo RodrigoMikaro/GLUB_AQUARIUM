@@ -11,6 +11,9 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
+// Biblioteca do Servo Motor para ESP32
+#include <ESP32Servo.h>
+
 // ======================================================
 // SENSOR DE TEMPERATURA DS18B20
 // ======================================================
@@ -44,8 +47,10 @@ const char* topic_voltagem         = "glub1/voltagem";
 const char* topic_troca            = "glub1/troca";
 const char* topic_status           = "glub1/troca/status";
 const char* topic_distancia        = "glub1/distancia";
-const char* topic_temperatura      = "glub1/temperatura";     // Envia a atual
-const char* topic_temperatura_set  = "glub1/temperatura/set"; // Recebe a desejada
+const char* topic_temperatura      = "glub1/temperatura";     
+const char* topic_temperatura_set  = "glub1/temperatura/set"; 
+const char* topic_alimentacao_freq = "glub1/alimentacao/frequencia";
+const char* topic_alimentacao_agora= "glub1/alimentacao/agora";      
 
 // ======================================================
 // PINOS
@@ -58,8 +63,18 @@ const int BOMBA_ESVAZIAR = 33;
 const int TRIG_PIN = 25;
 const int ECHO_PIN = 26;
 
-const int TERMOSTATO = 17; // NOVO: Relé do Aquecedor
-const int VENTOINHA  = 18; // NOVO: Relé do Cooler
+const int TERMOSTATO = 17; 
+const int VENTOINHA  = 18; 
+
+const int PINO_SERVO = 23; 
+
+// ======================================================
+// SERVO E ALIMENTAÇÃO
+// ======================================================
+Servo servoAlimentador;
+
+int frequenciaAlimentacao = 1; // 1 vez ao dia por padrão
+unsigned long ultimaAlimentacao = 0;
 
 // ======================================================
 // ULTRASSÔNICO
@@ -69,19 +84,14 @@ const float TEMP_C = 20.0;
 float distancia_Per_uSec;
 
 const int NUM_LEITURAS = 10;
-
 float leituras[NUM_LEITURAS];
-
 float soma = 0;
-
 int indice = 0;
 int leiturasValidas = 0;
 
 float distanciaCm = 0;
 float distanciaMediaCm = 0;
 
-// sensor a 36cm do fundo
-// parar em ~28cm
 const float DISTANCIA_MAX_RESERVATORIO_SUJO_CM = 28.0;
 
 // ======================================================
@@ -106,11 +116,8 @@ const unsigned long TEMPO_MAX_ENCHIMENTO = 180000;
 // VARIÁVEIS E CONTROLE TÉRMICO
 // ======================================================
 WebServer server(80);
-
 WiFiClientSecure espClient;
-
 PubSubClient client(espClient);
-
 Preferences preferences;
 
 String rede_local = "";
@@ -120,8 +127,7 @@ float voltagem = 0.0;
 
 unsigned long tempoTrocaAprendido = 0;
 
-// Variáveis de controle de temperatura
-float temperaturaDesejada = 25.0; // Tmedio padrão inicial caso não exista valor salvo
+float temperaturaDesejada = 25.0; 
 bool aquecendo = false;
 bool resfriando = false;
 
@@ -135,18 +141,14 @@ enum EstadoTroca {
 };
 
 EstadoTroca estadoTroca = IDLE;
-
 bool trocaAtiva = false;
-
 unsigned long inicioEtapa = 0;
 
 // ======================================================
 // PORTAL WIFI
 // ======================================================
 void handleRoot() {
-
   String html;
-
   html += "<html><body style='text-align:center;font-family:sans-serif;'>";
   html += "<h2>Configurar WiFi - GLUB</h2>";
   html += "<form action='/save' method='POST'>";
@@ -159,18 +161,13 @@ void handleRoot() {
 }
 
 void handleSave() {
-
   preferences.begin("wifi-config", false);
-
   preferences.putString("ssid", server.arg("ssid"));
   preferences.putString("pass", server.arg("pass"));
-
   preferences.end();
 
   server.send(200, "text/html", "Salvo! Reiniciando...");
-
   delay(2000);
-
   ESP.restart();
 }
 
@@ -178,49 +175,35 @@ void handleSave() {
 // NTP
 // ======================================================
 void sincronizarHora() {
-
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-
   time_t now = time(nullptr);
-
   int tentativas = 0;
 
   while(now < 8 * 3600 * 2 && tentativas < 20) {
-
     delay(500);
-
     now = time(nullptr);
-
     tentativas++;
   }
 }
 
 // ======================================================
-// RELÉS
+// RELÉS E BOMBAS
 // ======================================================
 const int RELE_ON  = HIGH;
 const int RELE_OFF = LOW;
 
-// ======================================================
-// BOMBAS
-// ======================================================
 void desligarBombas() {
-
   digitalWrite(BOMBA_ENCHER, RELE_OFF);
   digitalWrite(BOMBA_ESVAZIAR, RELE_OFF);
 }
 
 void ligarBombaEncher() {
-
   digitalWrite(BOMBA_ESVAZIAR, RELE_OFF);
-
   digitalWrite(BOMBA_ENCHER, RELE_ON);
 }
 
 void ligarBombaEsvaziar() {
-
   digitalWrite(BOMBA_ENCHER, RELE_OFF);
-
   digitalWrite(BOMBA_ESVAZIAR, RELE_ON);
 }
 
@@ -228,119 +211,126 @@ void ligarBombaEsvaziar() {
 // MQTT STATUS
 // ======================================================
 void publicarStatus(const char* msg) {
-
   if(client.connected()) {
-
     client.publish(topic_status, msg, true);
   }
 }
 
 // ======================================================
-// ULTRASSÔNICO
+// ALIMENTAÇÃO AUTOMÁTICA
+// ======================================================
+void realizarAlimentacao() {
+  Serial.println("Iniciando alimentacao (Simulando ida e volta no motor 360)...");
+
+  // 1. GIRA PARA FRENTE (Simulando a ida)
+  servoAlimentador.write(180); // Velocidade máxima para um lado
+  
+  // AJUSTE AQUI: O tempo necessário para ele dar meia volta (180 graus físicos)
+  // Se girar muito, diminua para 300. Se girar pouco, aumente para 600, etc.
+  delay(1000); 
+
+  // 2. PAUSA RÁPIDA NO FINAL DO CURSO
+  servoAlimentador.write(90); // Ponto morto (parado)
+  delay(500); // Fica parado meio segundo para a ração cair
+
+  // 3. GIRA PARA TRÁS (Simulando a volta para a posição inicial)
+  servoAlimentador.write(0);  // Velocidade máxima para o lado oposto
+  
+  // MANTENHA O MESMO TEMPO DA IDA para ele voltar exatamente para onde estava
+  delay(1000); 
+
+  // 4. PONTO MORTO (Para o motor definitivamente)
+  servoAlimentador.write(90);
+  
+  Serial.println("Alimentacao concluida. Motor parado.");
+  
+  // Atualiza o timer para a próxima alimentação automática
+  ultimaAlimentacao = millis();
+}
+
+void atualizarRotinaAlimentacao() {
+  // Se a frequência for 0, o agendamento automático está desligado
+  if (frequenciaAlimentacao <= 0) return;
+
+  // Calcula o intervalo em milissegundos baseado em 24h
+  unsigned long intervaloMs = (24UL * 60 * 60 * 1000) / frequenciaAlimentacao;
+
+  // Verifica se o tempo transcorrido é maior que o intervalo
+  if (millis() - ultimaAlimentacao >= intervaloMs) {
+    realizarAlimentacao();
+  }
+}
+
+// ======================================================
+// SENSORES
 // ======================================================
 void atualizarUltrassom() {
-
-  if(millis() - anteriorMillisUltrassom < intervaloUltrassom) {
-    return;
-  }
-
+  if(millis() - anteriorMillisUltrassom < intervaloUltrassom) return;
   anteriorMillisUltrassom = millis();
 
   digitalWrite(TRIG_PIN, LOW);
-
   delayMicroseconds(2);
-
   digitalWrite(TRIG_PIN, HIGH);
-
   delayMicroseconds(15);
-
   digitalWrite(TRIG_PIN, LOW);
 
   long duration = pulseIn(ECHO_PIN, HIGH, 15000);
 
   if(duration > 0 && duration < 25000) {
-
     distanciaCm = (duration / 2.0) * distancia_Per_uSec;
 
     if(leiturasValidas < NUM_LEITURAS) {
-
       leituras[indice] = distanciaCm;
-
       soma += distanciaCm;
-
       leiturasValidas++;
-    }
-    else {
-
+    } else {
       soma -= leituras[indice];
-
       leituras[indice] = distanciaCm;
-
       soma += distanciaCm;
     }
 
     indice = (indice + 1) % NUM_LEITURAS;
-
     distanciaMediaCm = soma / leiturasValidas;
   }
 }
 
-// ======================================================
-// INA226
-// ======================================================
 void tratarSensorINA226() {
-
   voltagem = ina226.getBusVoltage_V();
 }
 
-// ======================================================
-// DS18B20 (Temperatura)
-// ======================================================
 void tratarSensorTemperatura() {
-
-  if(millis() - anteriorMillisTemp < intervaloTemp) {
-    return;
-  }
+  if(millis() - anteriorMillisTemp < intervaloTemp) return;
   anteriorMillisTemp = millis();
 
   float tempLeitura = sensorTemp.getTempCByIndex(0);
-  
   if (tempLeitura != DEVICE_DISCONNECTED_C) {
     temperaturaAgua = tempLeitura;
   }
-
   sensorTemp.requestTemperatures();
 }
 
-// ======================================================
-// CONTROLE DO TERMOSTATO E VENTOINHA (Histerese)
-// ======================================================
 void atualizarControleTermico() {
-  // Ignora o controle se o sensor retornar erro de leitura para evitar acionamentos falsos
   if (temperaturaAgua <= 0.0 || temperaturaAgua == 85.0) return; 
 
   float tMin = temperaturaDesejada - 1.0;
   float tMax = temperaturaDesejada + 1.0;
 
-  // --- Lógica do Termostato (Aquecedor) ---
   if (temperaturaAgua <= tMin) {
     aquecendo = true;
-    resfriando = false; // Trava de segurança para não ligar ambos juntos
+    resfriando = false; 
   } 
   else if (temperaturaAgua >= temperaturaDesejada && aquecendo) {
     aquecendo = false;
   }
 
-  // --- Lógica da Ventoinha (Cooler) ---
   if (temperaturaAgua >= tMax) {
     resfriando = true;
-    aquecendo = false; // Trava de segurança para não ligar ambos juntos
+    aquecendo = false; 
   } 
   else if (temperaturaAgua <= temperaturaDesejada && resfriando) {
     resfriando = false;
   }
 
-  // Aciona fisicamente os pinos dos relés
   digitalWrite(TERMOSTATO, aquecendo ? RELE_ON : RELE_OFF);
   digitalWrite(VENTOINHA, resfriando ? RELE_ON : RELE_OFF);
 }
@@ -349,141 +339,73 @@ void atualizarControleTermico() {
 // TELEMETRIA MQTT
 // ======================================================
 void publicarTelemetriaMQTT() {
-
-  if(millis() - anteriorMillisTelemetria < intervaloTelemetria) {
-    return;
-  }
-
+  if(millis() - anteriorMillisTelemetria < intervaloTelemetria) return;
   anteriorMillisTelemetria = millis();
 
-  if(!client.connected()) {
-    return;
-  }
+  if(!client.connected()) return;
 
-  // VOLTAGEM
   char bufferVolt[10];
   dtostrf(voltagem, 4, 2, bufferVolt);
   client.publish(topic_voltagem, bufferVolt, true);
 
-  // DISTÂNCIA
   char bufferDist[10];
   dtostrf(distanciaMediaCm, 4, 1, bufferDist);
   client.publish(topic_distancia, bufferDist, true);
 
-  // TEMPERATURA ATUAL
   char bufferTemp[10];
   dtostrf(temperaturaAgua, 4, 2, bufferTemp);
   client.publish(topic_temperatura, bufferTemp, true);
-
-  Serial.print("MQTT -> Volt: ");
-  Serial.print(bufferVolt);
-  Serial.print("V | Dist: ");
-  Serial.print(bufferDist);
-  Serial.print("cm | Temp Atual: ");
-  Serial.print(bufferTemp);
-  Serial.print("C | Alvo: ");
-  Serial.print(temperaturaDesejada);
-  Serial.println("C");
 }
 
 // ======================================================
 // TROCA DE ÁGUA
 // ======================================================
 void iniciarTrocaAgua() {
-
   if(trocaAtiva) return;
-
   trocaAtiva = true;
-
   estadoTroca = DRENANDO;
-
   inicioEtapa = millis();
-
   ligarBombaEsvaziar();
-
   publicarStatus("drenando");
-
   Serial.println("Iniciando drenagem...");
 }
 
 void finalizarTroca() {
-
   desligarBombas();
-
   estadoTroca = IDLE;
-
   trocaAtiva = false;
-
   publicarStatus("concluido");
-
   Serial.println("Troca concluida.");
 }
 
 void atualizarTrocaAgua() {
-
   if(!trocaAtiva) return;
-
   unsigned long agora = millis();
 
   if(estadoTroca == DRENANDO) {
-
-    bool atingiuNivel =
-    (
-      distanciaMediaCm >= 24.0 &&
-      distanciaMediaCm <= 28.0
-    );
-
-    bool timeout =
-    (
-      agora - inicioEtapa >= TEMPO_MAX_DRENAGEM
-    );
+    bool atingiuNivel = (distanciaMediaCm >= 24.0 && distanciaMediaCm <= 28.0);
+    bool timeout = (agora - inicioEtapa >= TEMPO_MAX_DRENAGEM);
 
     if(atingiuNivel || timeout) {
-
-      unsigned long tempoDrenagem = agora - inicioEtapa;
-
       if(atingiuNivel) {
-
-        tempoTrocaAprendido = tempoDrenagem;
-
+        tempoTrocaAprendido = agora - inicioEtapa;
         preferences.begin("troca", false);
         preferences.putULong("tempo", tempoTrocaAprendido);
         preferences.end();
-
-        Serial.print("Tempo aprendido salvo: ");
-        Serial.println(tempoTrocaAprendido);
       }
-
       desligarBombas();
-
       ligarBombaEncher();
-
       estadoTroca = ENCHENDO;
-
       inicioEtapa = millis();
-
       publicarStatus("enchendo");
-
-      Serial.println("Enchendo aquario...");
     }
   }
   else if(estadoTroca == ENCHENDO) {
-
-    unsigned long tempoUsado;
-
-    if(tempoTrocaAprendido > 0) {
-      tempoUsado = tempoTrocaAprendido;
-    }
-    else {
-      tempoUsado = 30000;
-    }
-
+    unsigned long tempoUsado = (tempoTrocaAprendido > 0) ? tempoTrocaAprendido : 30000;
     bool terminou = (agora - inicioEtapa >= tempoUsado);
     bool timeout  = (agora - inicioEtapa >= TEMPO_MAX_ENCHIMENTO);
 
-    if(terminou || timeout) {
-      finalizarTroca();
-    }
+    if(terminou || timeout) finalizarTroca();
   }
 }
 
@@ -491,41 +413,25 @@ void atualizarTrocaAgua() {
 // CONEXÕES
 // ======================================================
 void manterConexoes() {
-
   if(WiFi.status() != WL_CONNECTED) {
-
     if(millis() - anteriorMillisWiFi >= 10000) {
-
-      WiFi.begin(
-        rede_local.c_str(),
-        senha_local.c_str()
-      );
-
+      WiFi.begin(rede_local.c_str(), senha_local.c_str());
       anteriorMillisWiFi = millis();
     }
-
     return;
   }
 
   if(!client.connected()) {
-
     if(millis() - anteriorMillisMQTT >= 10000) {
-
       String clientId = "ESP32_GLUB_" + String(random(0xffff), HEX);
-
       if(client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-
         client.subscribe(topic_led);
         client.subscribe(topic_troca);
-        client.subscribe(topic_temperatura_set); // NOVO: Inscrição no controle térmico
-
+        client.subscribe(topic_temperatura_set);
+        client.subscribe(topic_alimentacao_freq); // Tópico de frequência
+        client.subscribe(topic_alimentacao_agora); // Tópico de trigger manual
         Serial.println("MQTT conectado!");
       }
-      else {
-        Serial.print("Falha MQTT: ");
-        Serial.println(client.state());
-      }
-
       anteriorMillisMQTT = millis();
     }
   }
@@ -535,7 +441,6 @@ void manterConexoes() {
 // CALLBACK MQTT
 // ======================================================
 void callback(char* topic, byte* payload, unsigned int length) {
-
   String msg;
   for(int i = 0; i < length; i++) {
     msg += (char)payload[i];
@@ -554,23 +459,43 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   // TROCA DE ÁGUA
   if(strcmp(topic, topic_troca) == 0) {
-    if(msg == "1") {
-      iniciarTrocaAgua();
-    }
+    if(msg == "1") iniciarTrocaAgua();
   }
 
-  // NOVO: AJUSTE DE TEMPERATURA VIA MQTT (Tmedio)
+  // CONTROLE TÉRMICO
   if(strcmp(topic, topic_temperatura_set) == 0) {
     float novaTemp = msg.toFloat();
-    if(novaTemp > 10.0 && novaTemp < 40.0) { // Faixa de segurança básica para aquários
+    if(novaTemp > 10.0 && novaTemp < 40.0) { 
       temperaturaDesejada = novaTemp;
-      
       preferences.begin("controle_temp", false);
       preferences.putFloat("temp_ref", temperaturaDesejada);
       preferences.end();
-
-      Serial.print("Nova temperatura de referencia salva: ");
+      Serial.print("Nova temperatura alvo salva: ");
       Serial.println(temperaturaDesejada);
+    }
+  }
+
+  // ALIMENTAÇÃO MANUAL (AGORA)
+  if(strcmp(topic, topic_alimentacao_agora) == 0) {
+    if(msg == "1") {
+      realizarAlimentacao();
+    }
+  }
+
+  // FREQUÊNCIA DE ALIMENTAÇÃO
+  if(strcmp(topic, topic_alimentacao_freq) == 0) {
+    int freq = msg.toInt();
+    if(freq >= 0 && freq <= 3000) { 
+      frequenciaAlimentacao = freq;
+      preferences.begin("alimentacao", false);
+      preferences.putInt("freq", frequenciaAlimentacao);
+      preferences.end();
+      Serial.print("Frequencia de alimentacao atualizada: ");
+      Serial.print(frequenciaAlimentacao);
+      Serial.println(" vezes ao dia.");
+      
+      // Reseta o timer para iniciar a contagem a partir de agora com a nova frequência
+      ultimaAlimentacao = millis(); 
     }
   }
 }
@@ -579,73 +504,69 @@ void callback(char* topic, byte* payload, unsigned int length) {
 // SETUP
 // ======================================================
 void setup() {
-
   Serial.begin(115200);
 
-  // PINOS
+  // PINOS E RELÉS
   pinMode(ledPin, OUTPUT);
   pinMode(BOMBA_ENCHER, OUTPUT);
   pinMode(BOMBA_ESVAZIAR, OUTPUT);
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   
-  pinMode(TERMOSTATO, OUTPUT); // Configura pino do Termostato
-  pinMode(VENTOINHA, OUTPUT);  // Configura pino da Ventoinha
+  pinMode(TERMOSTATO, OUTPUT); 
+  pinMode(VENTOINHA, OUTPUT);  
 
   digitalWrite(TRIG_PIN, LOW);
   desligarBombas();
-  
-  // Inicia os novos relés desligados
   digitalWrite(TERMOSTATO, RELE_OFF);
   digitalWrite(VENTOINHA, RELE_OFF);
 
+  // INICIA O SERVO
+  servoAlimentador.attach(PINO_SERVO);
+  servoAlimentador.write(90); // Garante a posição inicial de parada (Ponto Morto)
+  
   // VELOCIDADE SOM
   float speed_Of_Sound = 331.1 + (0.606 * TEMP_C);
   distancia_Per_uSec = speed_Of_Sound / 10000.0;
-
-  // BUFFER
-  for(int i = 0; i < NUM_LEITURAS; i++) {
-    leituras[i] = 0;
-  }
 
   // DS18B20 INICIALIZAÇÃO
   sensorTemp.begin();
   sensorTemp.setWaitForConversion(false); 
   sensorTemp.requestTemperatures(); 
-  Serial.println("Sensor DS18B20 inicializado.");
 
   // INA226
   Wire.begin(PIN_SDA, PIN_SCL);
   if(ina226.init()) {
     ina226.setAverage(INA226_AVERAGE_16);
     ina226.setConversionTime(INA226_CONV_TIME_1100);
-    Serial.println("INA226 pronto.");
-  }
-  else {
-    Serial.println("Falha INA226.");
   }
 
-  // WIFI SALVO
+  // RECUPERANDO DADOS SALVOS DA FLASH
   preferences.begin("wifi-config", true);
   rede_local = preferences.getString("ssid", "");
   senha_local = preferences.getString("pass", "");
   preferences.end();
 
-  // TEMPO APRENDIDO
   preferences.begin("troca", true);
   tempoTrocaAprendido = preferences.getULong("tempo", 0);
   preferences.end();
-  Serial.print("Tempo salvo: ");
-  Serial.println(tempoTrocaAprendido);
 
-  // NOVO: RECUPERA TEMPERATURA DE REFERÊNCIA SALVA
   preferences.begin("controle_temp", true);
-  temperaturaDesejada = preferences.getFloat("temp_ref", 25.0); // 25°C padrão se vazio
+  temperaturaDesejada = preferences.getFloat("temp_ref", 25.0); 
   preferences.end();
-  Serial.print("Temperatura Alvo carregada: ");
-  Serial.println(temperaturaDesejada);
 
-  // WIFI
+  // RECUPERA A FREQUÊNCIA DE ALIMENTAÇÃO
+  preferences.begin("alimentacao", true);
+  frequenciaAlimentacao = preferences.getInt("freq", 1); // 1 vez ao dia se vazio
+  preferences.end();
+  Serial.print("Frequencia de alimentacao carregada: ");
+  Serial.print(frequenciaAlimentacao);
+  Serial.println(" vezes ao dia.");
+
+  // Inicializa o tempo da ultima alimentacao com o momento do boot
+  ultimaAlimentacao = millis();
+
+  // WIFI E PORTAL AP
   WiFi.setAutoReconnect(true);
   WiFi.persistent(true);
 
@@ -658,7 +579,6 @@ void setup() {
     }
   }
 
-  // PORTAL AP
   if(WiFi.status() != WL_CONNECTED) {
     WiFi.softAP("GLUB_1_WIFI", "GLUB_1_WIFI");
     server.on("/", handleRoot);
@@ -688,7 +608,6 @@ void setup() {
 // LOOP
 // ======================================================
 void loop() {
-
   manterConexoes();
 
   if(client.connected()) {
@@ -698,10 +617,11 @@ void loop() {
   atualizarUltrassom();
   tratarSensorINA226();
   tratarSensorTemperatura();
-  
-  // NOVO: Executa o controle térmico baseado nas regras estipuladas
   atualizarControleTermico();
-
   atualizarTrocaAgua();
+  
+  // Executa rotina passiva do alimentador automático
+  atualizarRotinaAlimentacao();
+
   publicarTelemetriaMQTT();
 }
