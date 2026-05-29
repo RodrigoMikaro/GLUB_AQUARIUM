@@ -42,9 +42,10 @@ const int mqtt_port = 8883;
 const char* mqtt_user = "glub1";
 const char* mqtt_pass = "GlubAquarium1";
 
-const char* topic_led             = "glub1/led";
+const char* topic_led              = "glub1/led";
 const char* topic_voltagem         = "glub1/voltagem";
-const char* topic_troca            = "glub1/troca";
+const char* topic_troca_freq       = "glub1/troca";             // Agora é "vezes a cada 30 dias"
+const char* topic_troca_agora      = "glub1/troca/agora";       
 const char* topic_status           = "glub1/troca/status";
 const char* topic_distancia        = "glub1/distancia";
 const char* topic_temperatura      = "glub1/temperatura";     
@@ -125,14 +126,12 @@ String senha_local = "";
 
 float voltagem = 0.0;
 
-unsigned long tempoTrocaAprendido = 0;
-
 float temperaturaDesejada = 25.0; 
 bool aquecendo = false;
 bool resfriando = false;
 
 // ======================================================
-// ESTADOS
+// ESTADOS DA TROCA DE ÁGUA
 // ======================================================
 enum EstadoTroca {
   IDLE,
@@ -143,6 +142,10 @@ enum EstadoTroca {
 EstadoTroca estadoTroca = IDLE;
 bool trocaAtiva = false;
 unsigned long inicioEtapa = 0;
+unsigned long tempoTrocaAprendido = 0;
+
+int frequenciaTroca = 0; // 0 = desligado por padrão (segurança)
+unsigned long ultimaTroca = 0;
 
 // ======================================================
 // PORTAL WIFI
@@ -220,44 +223,30 @@ void publicarStatus(const char* msg) {
 // ALIMENTAÇÃO AUTOMÁTICA
 // ======================================================
 void realizarAlimentacao() {
-  Serial.println("Iniciando alimentacao (Simulando ida e volta no motor 360)...");
+  Serial.println("Iniciando alimentacao...");
 
-  // 1. GIRA PARA FRENTE (Simulando a ida)
-  servoAlimentador.write(180); // Velocidade máxima para um lado
+  servoAlimentador.write(180); 
   delay(1000); 
 
-  // 2. PAUSA RÁPIDA NO FINAL DO CURSO
-  servoAlimentador.write(90); // Ponto morto (parado)
-  delay(500); // Fica parado meio segundo para a ração cair
+  servoAlimentador.write(90); 
+  delay(500); 
 
-  // 3. GIRA PARA TRÁS (Simulando a volta para a posição inicial)
-  servoAlimentador.write(0);  // Velocidade máxima para o lado oposto
+  servoAlimentador.write(0);  
   delay(1000); 
 
-  // 4. PONTO MORTO (Para o motor definitivamente)
   servoAlimentador.write(90);
-  
-  Serial.println("Alimentacao concluida. Motor parado.");
-  
-  // O ultimaAlimentacao = millis() foi removido daqui para evitar perda de fase!
+  Serial.println("Alimentacao concluida.");
 }
 
 void atualizarRotinaAlimentacao() {
-  // Se a frequência for 0, o agendamento automático está desligado
   if (frequenciaAlimentacao <= 0) return;
 
-  // Calcula o intervalo em milissegundos baseado em 24h
   unsigned long intervaloMs = (24UL * 60 * 60 * 1000) / frequenciaAlimentacao;
 
-  // Verifica se o tempo transcorrido é maior que o intervalo
   if (millis() - ultimaAlimentacao >= intervaloMs) {
     realizarAlimentacao();
-    
-    // Ajuste simples e perfeito para corrigir o desvio de tempo:
-    // Adicionamos o intervalo fixo para o cronômetro ignorar o tempo gasto pelo servo.
     ultimaAlimentacao += intervaloMs;
     
-    // Trava de segurança caso o sistema fique inativo por mais tempo que o intervalo:
     if (millis() - ultimaAlimentacao > intervaloMs) {
       ultimaAlimentacao = millis();
     }
@@ -412,6 +401,23 @@ void atualizarTrocaAgua() {
   }
 }
 
+void atualizarRotinaTrocaAuto() {
+  if (frequenciaTroca <= 0) return;
+
+  // Calcula o intervalo dividindo 30 dias (em ms) pela frequência
+  unsigned long intervaloMs = (30UL * 24UL * 60UL * 60UL * 1000UL) / frequenciaTroca;
+
+  // Soma contínua e perfeita do intervalo na variável ultimaTroca
+  if (millis() - ultimaTroca >= intervaloMs) {
+    iniciarTrocaAgua();
+    ultimaTroca += intervaloMs;
+    
+    if (millis() - ultimaTroca > intervaloMs) {
+      ultimaTroca = millis();
+    }
+  }
+}
+
 // ======================================================
 // CONEXÕES
 // ======================================================
@@ -429,10 +435,11 @@ void manterConexoes() {
       String clientId = "ESP32_GLUB_" + String(random(0xffff), HEX);
       if(client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
         client.subscribe(topic_led);
-        client.subscribe(topic_troca);
+        client.subscribe(topic_troca_freq); // Tópico de frequência da troca
+        client.subscribe(topic_troca_agora); // Tópico de trigger manual da troca
         client.subscribe(topic_temperatura_set);
-        client.subscribe(topic_alimentacao_freq); // Tópico de frequência
-        client.subscribe(topic_alimentacao_agora); // Tópico de trigger manual
+        client.subscribe(topic_alimentacao_freq); 
+        client.subscribe(topic_alimentacao_agora); 
         Serial.println("MQTT conectado!");
       }
       anteriorMillisMQTT = millis();
@@ -460,9 +467,25 @@ void callback(char* topic, byte* payload, unsigned int length) {
     else if(msg == "0") digitalWrite(ledPin, LOW);
   }
 
-  // TROCA DE ÁGUA
-  if(strcmp(topic, topic_troca) == 0) {
+  // TROCA DE ÁGUA MANUAL (AGORA)
+  if(strcmp(topic, topic_troca_agora) == 0) {
     if(msg == "1") iniciarTrocaAgua();
+  }
+
+  // FREQUÊNCIA DA TROCA DE ÁGUA (VEZES A CADA 30 DIAS)
+  if(strcmp(topic, topic_troca_freq) == 0) {
+    int freq = msg.toInt();
+    if(freq >= 0) { 
+      frequenciaTroca = freq;
+      preferences.begin("troca", false); 
+      preferences.putInt("freq_troca", frequenciaTroca);
+      preferences.end();
+      Serial.print("Frequencia de troca atualizada para: ");
+      Serial.print(frequenciaTroca);
+      Serial.println(" vezes a cada 30 dias.");
+      
+      ultimaTroca = millis(); 
+    }
   }
 
   // CONTROLE TÉRMICO
@@ -497,7 +520,6 @@ void callback(char* topic, byte* payload, unsigned int length) {
       Serial.print(frequenciaAlimentacao);
       Serial.println(" vezes ao dia.");
       
-      // Reseta o timer para iniciar a contagem a partir de agora com a nova frequência
       ultimaAlimentacao = millis(); 
     }
   }
@@ -526,7 +548,7 @@ void setup() {
 
   // INICIA O SERVO
   servoAlimentador.attach(PINO_SERVO);
-  servoAlimentador.write(90); // Garante a posição inicial de parada (Ponto Morto)
+  servoAlimentador.write(90); 
   
   // VELOCIDADE SOM
   float speed_Of_Sound = 331.1 + (0.606 * TEMP_C);
@@ -550,23 +572,28 @@ void setup() {
   senha_local = preferences.getString("pass", "");
   preferences.end();
 
+  // RECUPERA DADOS DA TROCA
   preferences.begin("troca", true);
   tempoTrocaAprendido = preferences.getULong("tempo", 0);
+  frequenciaTroca = preferences.getInt("freq_troca", 0); // 0 padrão = desligado
   preferences.end();
+  Serial.print("Frequencia de troca de agua carregada: ");
+  Serial.print(frequenciaTroca);
+  Serial.println(" vezes a cada 30 dias.");
+  ultimaTroca = millis();
 
+  // RECUPERA DADOS CONTROLE TÉRMICO
   preferences.begin("controle_temp", true);
   temperaturaDesejada = preferences.getFloat("temp_ref", 25.0); 
   preferences.end();
 
   // RECUPERA A FREQUÊNCIA DE ALIMENTAÇÃO
   preferences.begin("alimentacao", true);
-  frequenciaAlimentacao = preferences.getInt("freq", 1); // 1 vez ao dia se vazio
+  frequenciaAlimentacao = preferences.getInt("freq", 1); 
   preferences.end();
   Serial.print("Frequencia de alimentacao carregada: ");
   Serial.print(frequenciaAlimentacao);
   Serial.println(" vezes ao dia.");
-
-  // Inicializa o tempo da ultima alimentacao com o momento do boot
   ultimaAlimentacao = millis();
 
   // WIFI E PORTAL AP
@@ -621,10 +648,11 @@ void loop() {
   tratarSensorINA226();
   tratarSensorTemperatura();
   atualizarControleTermico();
-  atualizarTrocaAgua();
   
-  // Executa rotina passiva do alimentador automático
-  atualizarRotinaAlimentacao();
+  atualizarTrocaAgua();           // Processa a troca caso esteja em andamento
+  atualizarRotinaTrocaAuto();     // Agendador automático da troca
+  
+  atualizarRotinaAlimentacao();   // Agendador automático da alimentação
 
   publicarTelemetriaMQTT();
 }
