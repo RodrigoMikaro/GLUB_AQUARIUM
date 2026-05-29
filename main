@@ -224,9 +224,6 @@ void realizarAlimentacao() {
 
   // 1. GIRA PARA FRENTE (Simulando a ida)
   servoAlimentador.write(180); // Velocidade máxima para um lado
-  
-  // AJUSTE AQUI: O tempo necessário para ele dar meia volta (180 graus físicos)
-  // Se girar muito, diminua para 300. Se girar pouco, aumente para 600, etc.
   delay(1000); 
 
   // 2. PAUSA RÁPIDA NO FINAL DO CURSO
@@ -235,8 +232,6 @@ void realizarAlimentacao() {
 
   // 3. GIRA PARA TRÁS (Simulando a volta para a posição inicial)
   servoAlimentador.write(0);  // Velocidade máxima para o lado oposto
-  
-  // MANTENHA O MESMO TEMPO DA IDA para ele voltar exatamente para onde estava
   delay(1000); 
 
   // 4. PONTO MORTO (Para o motor definitivamente)
@@ -244,8 +239,7 @@ void realizarAlimentacao() {
   
   Serial.println("Alimentacao concluida. Motor parado.");
   
-  // Atualiza o timer para a próxima alimentação automática
-  ultimaAlimentacao = millis();
+  // O ultimaAlimentacao = millis() foi removido daqui para evitar perda de fase!
 }
 
 void atualizarRotinaAlimentacao() {
@@ -258,6 +252,15 @@ void atualizarRotinaAlimentacao() {
   // Verifica se o tempo transcorrido é maior que o intervalo
   if (millis() - ultimaAlimentacao >= intervaloMs) {
     realizarAlimentacao();
+    
+    // Ajuste simples e perfeito para corrigir o desvio de tempo:
+    // Adicionamos o intervalo fixo para o cronômetro ignorar o tempo gasto pelo servo.
+    ultimaAlimentacao += intervaloMs;
+    
+    // Trava de segurança caso o sistema fique inativo por mais tempo que o intervalo:
+    if (millis() - ultimaAlimentacao > intervaloMs) {
+      ultimaAlimentacao = millis();
+    }
   }
 }
 
