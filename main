@@ -52,6 +52,7 @@ const char* topic_temperatura      = "glub1/temperatura";
 const char* topic_temperatura_set  = "glub1/temperatura/set";  
 const char* topic_alimentacao_freq = "glub1/alimentacao/frequencia";
 const char* topic_alimentacao_agora= "glub1/alimentacao/agora";      
+const char* topic_iluminacao       = "glub1/iluminacao"; // NOVO TÓPICO
 
 // ======================================================
 // PINOS
@@ -68,11 +69,22 @@ const int TERMOSTATO = 17;
 const int VENTOINHA  = 18; 
 
 const int PINO_SERVO = 23; 
+const int PINO_ILUMINACAO = 27; // Pino PWM para a iluminação (Altere se necessário)
+
+// ======================================================
+// ILUMINAÇÃO (PWM)
+// ======================================================
+int intensidadeIluminacao = 0; // 0 a 100
 
 // ======================================================
 // SERVO E ALIMENTAÇÃO (AGORA COM MILLIS / MÁQUINA DE ESTADOS)
 // ======================================================
 Servo servoAlimentador;
+
+// AJUSTE FINO DO SERVO (Evita deslizamento e batidas mecânicas)
+const int SERVO_REPOUSO = 90;
+const int SERVO_FRENTE  = 170; // Em vez de 180, para não bater no final de curso
+const int SERVO_TRAS    = 10;  // Em vez de 0, para não bater no começo de curso
 
 int frequenciaAlimentacao = 1; // 1 vez ao dia por padrão
 unsigned long ultimaAlimentacao = 0;
@@ -232,13 +244,13 @@ void publicarStatus(const char* msg) {
 }
 
 // ======================================================
-// ALIMENTAÇÃO AUTOMÁTICA (NÃO-BLOQUEANTE)
+// ALIMENTAÇÃO AUTOMÁTICA (NÃO-BLOQUEANTE COM LIMITES SEGUROS)
 // ======================================================
 void iniciarAlimentacao() {
   if (estadoAlim != ALIM_IDLE) return; // Se já estiver alimentando, ignora
   
   Serial.println("Iniciando alimentacao...");
-  servoAlimentador.write(180); 
+  servoAlimentador.write(SERVO_FRENTE); // Usa a variável de segurança
   tempoEstadoAlim = millis();
   estadoAlim = PASSO_1;
 }
@@ -256,19 +268,19 @@ void atualizarRotinaAlimentacao() {
     }
   }
 
-  // 2. Máquina de estados do Servo (Substitui os delays antigos)
+  // 2. Máquina de estados do Servo (Usando limites seguros)
   if (estadoAlim == PASSO_1 && (millis() - tempoEstadoAlim >= 1000)) {
-    servoAlimentador.write(90); 
+    servoAlimentador.write(SERVO_REPOUSO); 
     tempoEstadoAlim = millis();
     estadoAlim = PASSO_2;
   }
   else if (estadoAlim == PASSO_2 && (millis() - tempoEstadoAlim >= 500)) {
-    servoAlimentador.write(0);  
+    servoAlimentador.write(SERVO_TRAS);  
     tempoEstadoAlim = millis();
     estadoAlim = PASSO_3;
   }
   else if (estadoAlim == PASSO_3 && (millis() - tempoEstadoAlim >= 1000)) {
-    servoAlimentador.write(90);
+    servoAlimentador.write(SERVO_REPOUSO);
     estadoAlim = ALIM_IDLE; // Retorna para ocioso
     Serial.println("Alimentacao concluida.");
   }
@@ -463,6 +475,7 @@ void manterConexoes() {
         client.subscribe(topic_temperatura_set);
         client.subscribe(topic_alimentacao_freq); 
         client.subscribe(topic_alimentacao_agora); 
+        client.subscribe(topic_iluminacao); // Inscreve no tópico da iluminação
         Serial.println("MQTT conectado!");
       }
       anteriorMillisMQTT = millis();
@@ -484,10 +497,31 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.print("] => ");
   Serial.println(msg);
 
-  // LED
+  // LED STATUS
   if(strcmp(topic, topic_led) == 0) {
     if(msg == "1")      digitalWrite(ledPin, HIGH);
     else if(msg == "0") digitalWrite(ledPin, LOW);
+  }
+
+  // ILUMINAÇÃO PWM (0 a 100)
+  if(strcmp(topic, topic_iluminacao) == 0) {
+    int brilho = msg.toInt();
+    if(brilho >= 0 && brilho <= 100) {
+      intensidadeIluminacao = brilho;
+      
+      // Converte 0-100 para o range PWM 0-255 do Arduino/ESP32
+      int pwmValue = map(intensidadeIluminacao, 0, 100, 0, 255);
+      analogWrite(PINO_ILUMINACAO, pwmValue);
+      
+      // Salva na memória
+      preferences.begin("luz", false);
+      preferences.putInt("brilho", intensidadeIluminacao);
+      preferences.end();
+      
+      Serial.print("Iluminacao ajustada para: ");
+      Serial.print(intensidadeIluminacao);
+      Serial.println("%");
+    }
   }
 
   // TROCA DE ÁGUA MANUAL (AGORA)
@@ -524,7 +558,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
   }
 
-  // ALIMENTAÇÃO MANUAL (AGORA - CHAMA A FUNÇÃO NÃO-BLOQUEANTE)
+  // ALIMENTAÇÃO MANUAL (AGORA)
   if(strcmp(topic, topic_alimentacao_agora) == 0) {
     if(msg == "1") {
       iniciarAlimentacao();
@@ -563,6 +597,8 @@ void setup() {
   
   pinMode(TERMOSTATO, OUTPUT); 
   pinMode(VENTOINHA, OUTPUT);  
+  
+  pinMode(PINO_ILUMINACAO, OUTPUT); // Pino da nova iluminação
 
   digitalWrite(TRIG_PIN, LOW);
   desligarBombas();
@@ -571,7 +607,7 @@ void setup() {
 
   // INICIA O SERVO
   servoAlimentador.attach(PINO_SERVO);
-  servoAlimentador.write(90); 
+  servoAlimentador.write(SERVO_REPOUSO); 
   
   // VELOCIDADE SOM
   float speed_Of_Sound = 331.1 + (0.606 * TEMP_C);
@@ -618,6 +654,15 @@ void setup() {
   Serial.print(frequenciaAlimentacao);
   Serial.println(" vezes ao dia.");
   ultimaAlimentacao = millis();
+
+  // RECUPERA E APLICA ILUMINAÇÃO
+  preferences.begin("luz", true);
+  intensidadeIluminacao = preferences.getInt("brilho", 0); // O padrão é desligado (0) se não existir
+  preferences.end();
+  analogWrite(PINO_ILUMINACAO, map(intensidadeIluminacao, 0, 100, 0, 255));
+  Serial.print("Nivel de iluminacao carregado: ");
+  Serial.print(intensidadeIluminacao);
+  Serial.println("%");
 
   // WIFI E PORTAL AP
   WiFi.setAutoReconnect(true);
