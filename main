@@ -44,7 +44,7 @@ const char* mqtt_pass = "GlubAquarium1";
 
 const char* topic_led              = "glub1/led";
 const char* topic_voltagem         = "glub1/voltagem";
-const char* topic_troca_freq       = "glub1/troca";             
+const char* topic_troca_freq       = "glub1/troca";            
 const char* topic_troca_agora      = "glub1/troca/agora";        
 const char* topic_status           = "glub1/troca/status";
 const char* topic_distancia        = "glub1/distancia";
@@ -81,10 +81,15 @@ int intensidadeIluminacao = 0; // 0 a 100
 // ======================================================
 Servo servoAlimentador;
 
-// AJUSTE FINO DO SERVO (Evita deslizamento e batidas mecânicas)
+// Valores originais do seu motor 360
 const int SERVO_REPOUSO = 90;
-const int SERVO_FRENTE  = 170; // Em vez de 180, para não bater no final de curso
-const int SERVO_TRAS    = 10;  // Em vez de 0, para não bater no começo de curso
+const int SERVO_FRENTE  = 180; // Velocidade máxima para um lado
+const int SERVO_TRAS    = 0;   // Velocidade máxima para o lado oposto
+
+// Tempos calibrados por você (em milissegundos)
+const unsigned long TEMPO_GIRAR_FRENTE = 1000;
+const unsigned long TEMPO_PAUSA        = 500;
+const unsigned long TEMPO_GIRAR_TRAS   = 1000;
 
 int frequenciaAlimentacao = 1; // 1 vez ao dia por padrão
 unsigned long ultimaAlimentacao = 0;
@@ -268,18 +273,18 @@ void atualizarRotinaAlimentacao() {
     }
   }
 
-  // 2. Máquina de estados do Servo (Usando limites seguros)
-  if (estadoAlim == PASSO_1 && (millis() - tempoEstadoAlim >= 1000)) {
+  // 2. Máquina de estados do Servo (Usando os seus tempos configurados)
+  if (estadoAlim == PASSO_1 && (millis() - tempoEstadoAlim >= TEMPO_GIRAR_FRENTE)) {
     servoAlimentador.write(SERVO_REPOUSO); 
     tempoEstadoAlim = millis();
     estadoAlim = PASSO_2;
   }
-  else if (estadoAlim == PASSO_2 && (millis() - tempoEstadoAlim >= 500)) {
+  else if (estadoAlim == PASSO_2 && (millis() - tempoEstadoAlim >= TEMPO_PAUSA)) {
     servoAlimentador.write(SERVO_TRAS);  
     tempoEstadoAlim = millis();
     estadoAlim = PASSO_3;
   }
-  else if (estadoAlim == PASSO_3 && (millis() - tempoEstadoAlim >= 1000)) {
+  else if (estadoAlim == PASSO_3 && (millis() - tempoEstadoAlim >= TEMPO_GIRAR_TRAS)) {
     servoAlimentador.write(SERVO_REPOUSO);
     estadoAlim = ALIM_IDLE; // Retorna para ocioso
     Serial.println("Alimentacao concluida.");
