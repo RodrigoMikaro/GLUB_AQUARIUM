@@ -44,12 +44,12 @@ const char* mqtt_pass = "GlubAquarium1";
 
 const char* topic_led              = "glub1/led";
 const char* topic_voltagem         = "glub1/voltagem";
-const char* topic_troca_freq       = "glub1/troca";             // Agora é "vezes a cada 30 dias"
-const char* topic_troca_agora      = "glub1/troca/agora";       
+const char* topic_troca_freq       = "glub1/troca";             
+const char* topic_troca_agora      = "glub1/troca/agora";        
 const char* topic_status           = "glub1/troca/status";
 const char* topic_distancia        = "glub1/distancia";
-const char* topic_temperatura      = "glub1/temperatura";     
-const char* topic_temperatura_set  = "glub1/temperatura/set"; 
+const char* topic_temperatura      = "glub1/temperatura";      
+const char* topic_temperatura_set  = "glub1/temperatura/set";  
 const char* topic_alimentacao_freq = "glub1/alimentacao/frequencia";
 const char* topic_alimentacao_agora= "glub1/alimentacao/agora";      
 
@@ -70,12 +70,17 @@ const int VENTOINHA  = 18;
 const int PINO_SERVO = 23; 
 
 // ======================================================
-// SERVO E ALIMENTAÇÃO
+// SERVO E ALIMENTAÇÃO (AGORA COM MILLIS / MÁQUINA DE ESTADOS)
 // ======================================================
 Servo servoAlimentador;
 
 int frequenciaAlimentacao = 1; // 1 vez ao dia por padrão
 unsigned long ultimaAlimentacao = 0;
+
+// Estados para a rotina de alimentação não-bloqueante
+enum EstadoAlimentacao { ALIM_IDLE, PASSO_1, PASSO_2, PASSO_3 };
+EstadoAlimentacao estadoAlim = ALIM_IDLE;
+unsigned long tempoEstadoAlim = 0;
 
 // ======================================================
 // ULTRASSÔNICO
@@ -96,7 +101,7 @@ float distanciaMediaCm = 0;
 const float DISTANCIA_MAX_RESERVATORIO_SUJO_CM = 28.0;
 
 // ======================================================
-// TEMPOS
+// TEMPOS E VARIÁVEIS GERAIS
 // ======================================================
 unsigned long anteriorMillisMQTT = 0;
 unsigned long anteriorMillisWiFi = 0;
@@ -112,6 +117,10 @@ const unsigned long intervaloTemp = 2000;
 // segurança
 const unsigned long TEMPO_MAX_DRENAGEM   = 180000;
 const unsigned long TEMPO_MAX_ENCHIMENTO = 180000;
+
+// Variáveis para reiniciar o ESP32 sem usar delay
+bool aguardandoReinicio = false;
+unsigned long tempoInicioReinicio = 0;
 
 // ======================================================
 // VARIÁVEIS E CONTROLE TÉRMICO
@@ -169,9 +178,11 @@ void handleSave() {
   preferences.putString("pass", server.arg("pass"));
   preferences.end();
 
-  server.send(200, "text/html", "Salvo! Reiniciando...");
-  delay(2000);
-  ESP.restart();
+  server.send(200, "text/html", "Salvo! Reiniciando em instantes...");
+  
+  // Aciona a flag para reiniciar via millis no loop da configuração
+  aguardandoReinicio = true;
+  tempoInicioReinicio = millis();
 }
 
 // ======================================================
@@ -182,6 +193,7 @@ void sincronizarHora() {
   time_t now = time(nullptr);
   int tentativas = 0;
 
+  // No setup é aceitável manter o delay para aguardar a rede
   while(now < 8 * 3600 * 2 && tentativas < 20) {
     delay(500);
     now = time(nullptr);
@@ -220,36 +232,45 @@ void publicarStatus(const char* msg) {
 }
 
 // ======================================================
-// ALIMENTAÇÃO AUTOMÁTICA
+// ALIMENTAÇÃO AUTOMÁTICA (NÃO-BLOQUEANTE)
 // ======================================================
-void realizarAlimentacao() {
+void iniciarAlimentacao() {
+  if (estadoAlim != ALIM_IDLE) return; // Se já estiver alimentando, ignora
+  
   Serial.println("Iniciando alimentacao...");
-
   servoAlimentador.write(180); 
-  delay(1000); 
-
-  servoAlimentador.write(90); 
-  delay(500); 
-
-  servoAlimentador.write(0);  
-  delay(1000); 
-
-  servoAlimentador.write(90);
-  Serial.println("Alimentacao concluida.");
+  tempoEstadoAlim = millis();
+  estadoAlim = PASSO_1;
 }
 
 void atualizarRotinaAlimentacao() {
-  if (frequenciaAlimentacao <= 0) return;
-
-  unsigned long intervaloMs = (24UL * 60 * 60 * 1000) / frequenciaAlimentacao;
-
-  if (millis() - ultimaAlimentacao >= intervaloMs) {
-    realizarAlimentacao();
-    ultimaAlimentacao += intervaloMs;
-    
-    if (millis() - ultimaAlimentacao > intervaloMs) {
-      ultimaAlimentacao = millis();
+  // 1. Verifica se é hora de alimentar automaticamente
+  if (frequenciaAlimentacao > 0 && estadoAlim == ALIM_IDLE) {
+    unsigned long intervaloMs = (24UL * 60 * 60 * 1000) / frequenciaAlimentacao;
+    if (millis() - ultimaAlimentacao >= intervaloMs) {
+      iniciarAlimentacao();
+      ultimaAlimentacao += intervaloMs;
+      if (millis() - ultimaAlimentacao > intervaloMs) {
+        ultimaAlimentacao = millis();
+      }
     }
+  }
+
+  // 2. Máquina de estados do Servo (Substitui os delays antigos)
+  if (estadoAlim == PASSO_1 && (millis() - tempoEstadoAlim >= 1000)) {
+    servoAlimentador.write(90); 
+    tempoEstadoAlim = millis();
+    estadoAlim = PASSO_2;
+  }
+  else if (estadoAlim == PASSO_2 && (millis() - tempoEstadoAlim >= 500)) {
+    servoAlimentador.write(0);  
+    tempoEstadoAlim = millis();
+    estadoAlim = PASSO_3;
+  }
+  else if (estadoAlim == PASSO_3 && (millis() - tempoEstadoAlim >= 1000)) {
+    servoAlimentador.write(90);
+    estadoAlim = ALIM_IDLE; // Retorna para ocioso
+    Serial.println("Alimentacao concluida.");
   }
 }
 
@@ -266,6 +287,8 @@ void atualizarUltrassom() {
   delayMicroseconds(15);
   digitalWrite(TRIG_PIN, LOW);
 
+  // pulseIn tem um timeout de 15ms (15000us), o que é rápido o suficiente 
+  // para não travar as outras rotinas baseadas em millis
   long duration = pulseIn(ECHO_PIN, HIGH, 15000);
 
   if(duration > 0 && duration < 25000) {
@@ -419,7 +442,7 @@ void atualizarRotinaTrocaAuto() {
 }
 
 // ======================================================
-// CONEXÕES
+// CONEXÕES E MANUTENÇÃO WIFI/MQTT
 // ======================================================
 void manterConexoes() {
   if(WiFi.status() != WL_CONNECTED) {
@@ -435,8 +458,8 @@ void manterConexoes() {
       String clientId = "ESP32_GLUB_" + String(random(0xffff), HEX);
       if(client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
         client.subscribe(topic_led);
-        client.subscribe(topic_troca_freq); // Tópico de frequência da troca
-        client.subscribe(topic_troca_agora); // Tópico de trigger manual da troca
+        client.subscribe(topic_troca_freq); 
+        client.subscribe(topic_troca_agora); 
         client.subscribe(topic_temperatura_set);
         client.subscribe(topic_alimentacao_freq); 
         client.subscribe(topic_alimentacao_agora); 
@@ -472,7 +495,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
     if(msg == "1") iniciarTrocaAgua();
   }
 
-  // FREQUÊNCIA DA TROCA DE ÁGUA (VEZES A CADA 30 DIAS)
+  // FREQUÊNCIA DA TROCA DE ÁGUA
   if(strcmp(topic, topic_troca_freq) == 0) {
     int freq = msg.toInt();
     if(freq >= 0) { 
@@ -501,10 +524,10 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
   }
 
-  // ALIMENTAÇÃO MANUAL (AGORA)
+  // ALIMENTAÇÃO MANUAL (AGORA - CHAMA A FUNÇÃO NÃO-BLOQUEANTE)
   if(strcmp(topic, topic_alimentacao_agora) == 0) {
     if(msg == "1") {
-      realizarAlimentacao();
+      iniciarAlimentacao();
     }
   }
 
@@ -575,7 +598,7 @@ void setup() {
   // RECUPERA DADOS DA TROCA
   preferences.begin("troca", true);
   tempoTrocaAprendido = preferences.getULong("tempo", 0);
-  frequenciaTroca = preferences.getInt("freq_troca", 0); // 0 padrão = desligado
+  frequenciaTroca = preferences.getInt("freq_troca", 0); 
   preferences.end();
   Serial.print("Frequencia de troca de agua carregada: ");
   Serial.print(frequenciaTroca);
@@ -604,7 +627,7 @@ void setup() {
     WiFi.begin(rede_local.c_str(), senha_local.c_str());
     int count = 0;
     while(WiFi.status() != WL_CONNECTED && count < 20) {
-      delay(500);
+      delay(500); // (Delays no Setup para pareamento não afetam o Loop principal)
       count++;
     }
   }
@@ -618,6 +641,11 @@ void setup() {
     while(WiFi.status() != WL_CONNECTED) {
       server.handleClient();
       digitalWrite(ledPin, (millis() / 500) % 2);
+      
+      // Checagem se o portal solicitou um reinicio (sem usar delay)
+      if (aguardandoReinicio && (millis() - tempoInicioReinicio >= 2000)) {
+        ESP.restart();
+      }
     }
     server.stop();
     WiFi.softAPdisconnect(true);
@@ -635,7 +663,7 @@ void setup() {
 }
 
 // ======================================================
-// LOOP
+// LOOP PRINCIPAL (100% NON-BLOCKING)
 // ======================================================
 void loop() {
   manterConexoes();
@@ -649,10 +677,10 @@ void loop() {
   tratarSensorTemperatura();
   atualizarControleTermico();
   
-  atualizarTrocaAgua();           // Processa a troca caso esteja em andamento
-  atualizarRotinaTrocaAuto();     // Agendador automático da troca
+  atualizarTrocaAgua();           
+  atualizarRotinaTrocaAuto();     
   
-  atualizarRotinaAlimentacao();   // Agendador automático da alimentação
+  atualizarRotinaAlimentacao();   // Processa os movimentos do servo sem parar o ESP32
 
   publicarTelemetriaMQTT();
 }
