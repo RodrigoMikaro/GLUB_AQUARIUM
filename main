@@ -115,8 +115,6 @@ int leiturasValidas = 0;
 float distanciaCm = 0;
 float distanciaMediaCm = 0;
 
-const float DISTANCIA_MAX_RESERVATORIO_SUJO_CM = 28.0;
-
 // ======================================================
 // TEMPOS E VARIÁVEIS GERAIS
 // ======================================================
@@ -130,10 +128,6 @@ unsigned long anteriorMillisTemp = 0;
 const unsigned long intervaloUltrassom = 100;
 const unsigned long intervaloTelemetria = 1000;
 const unsigned long intervaloTemp = 2000; 
-
-// segurança
-const unsigned long TEMPO_MAX_DRENAGEM   = 180000;
-const unsigned long TEMPO_MAX_ENCHIMENTO = 180000;
 
 // Variáveis para reiniciar o ESP32 sem usar delay
 bool aguardandoReinicio = false;
@@ -168,10 +162,13 @@ enum EstadoTroca {
 EstadoTroca estadoTroca = IDLE;
 bool trocaAtiva = false;
 unsigned long inicioEtapa = 0;
-unsigned long tempoTrocaAprendido = 0;
 
 int frequenciaTroca = 0; // 0 = desligado por padrão (segurança)
 unsigned long ultimaTroca = 0;
+
+// Constantes de tempo da troca de água
+const unsigned long TEMPO_BOMBA_DRENAR = 35000; // 35 segundos
+const unsigned long TEMPO_BOMBA_ENCHER = 35000; // 35 segundos
 
 // ======================================================
 // PORTAL WIFI
@@ -394,12 +391,20 @@ void publicarTelemetriaMQTT() {
 // ======================================================
 void iniciarTrocaAgua() {
   if(trocaAtiva) return;
+
+  // VERIFICAÇÃO DE SEGURANÇA: Só troca a água se a média de distância for maior que 31cm
+  if (distanciaMediaCm <= 31.0) {
+    Serial.println("Troca abortada: distancia media <= 31cm. Reservatorio sujo pode estar cheio.");
+    publicarStatus("abortado - nivel de seguranca");
+    return;
+  }
+
   trocaAtiva = true;
   estadoTroca = DRENANDO;
   inicioEtapa = millis();
   ligarBombaEsvaziar();
   publicarStatus("drenando");
-  Serial.println("Iniciando drenagem...");
+  Serial.println("Iniciando drenagem por 35 segundos...");
 }
 
 void finalizarTroca() {
@@ -415,29 +420,21 @@ void atualizarTrocaAgua() {
   unsigned long agora = millis();
 
   if(estadoTroca == DRENANDO) {
-    bool atingiuNivel = (distanciaMediaCm >= 24.0 && distanciaMediaCm <= 28.0);
-    bool timeout = (agora - inicioEtapa >= TEMPO_MAX_DRENAGEM);
-
-    if(atingiuNivel || timeout) {
-      if(atingiuNivel) {
-        tempoTrocaAprendido = agora - inicioEtapa;
-        preferences.begin("troca", false);
-        preferences.putULong("tempo", tempoTrocaAprendido);
-        preferences.end();
-      }
+    // Fica drenando por 35 segundos
+    if(agora - inicioEtapa >= TEMPO_BOMBA_DRENAR) {
       desligarBombas();
       ligarBombaEncher();
       estadoTroca = ENCHENDO;
       inicioEtapa = millis();
       publicarStatus("enchendo");
+      Serial.println("Drenagem finalizada. Iniciando enchimento por 35 segundos...");
     }
   }
   else if(estadoTroca == ENCHENDO) {
-    unsigned long tempoUsado = (tempoTrocaAprendido > 0) ? tempoTrocaAprendido : 30000;
-    bool terminou = (agora - inicioEtapa >= tempoUsado);
-    bool timeout  = (agora - inicioEtapa >= TEMPO_MAX_ENCHIMENTO);
-
-    if(terminou || timeout) finalizarTroca();
+    // Fica enchendo por 35 segundos
+    if(agora - inicioEtapa >= TEMPO_BOMBA_ENCHER) {
+      finalizarTroca();
+    }
   }
 }
 
@@ -638,7 +635,6 @@ void setup() {
 
   // RECUPERA DADOS DA TROCA
   preferences.begin("troca", true);
-  tempoTrocaAprendido = preferences.getULong("tempo", 0);
   frequenciaTroca = preferences.getInt("freq_troca", 0); 
   preferences.end();
   Serial.print("Frequencia de troca de agua carregada: ");
