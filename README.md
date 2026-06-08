@@ -86,10 +86,9 @@ O fluxo de funcionamento é o seguinte:
 
 ![Arquitetura geral](./imagens/arquitetura_geral.png)
 
-### siuu
-<!-- inserir aqui a imagem da montagem eletro-eletrônica -->
+### Montagem eletro-eletrônica
 
-![Montagem eletro-eletrônica](./imagens/montagem_eletroeletronica.png)
+![Montagem eletro-eletrônica](circuito.png)
 
 ---
 
