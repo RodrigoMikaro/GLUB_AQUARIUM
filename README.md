@@ -81,10 +81,9 @@ O fluxo de funcionamento é o seguinte:
 
 ![Diagrama em blocos do sistema](./imagens/diagrama_blocos.png)
 
-### siuu
-<!-- inserir aqui a imagem da arquitetura geral / MQTT -->
+### Arquitetura
 
-![Arquitetura geral](./imagens/arquitetura_geral.png)
+![Arquitetura geral](arquitetura.png)
 
 ### Montagem eletro-eletrônica
 
