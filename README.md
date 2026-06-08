@@ -6,6 +6,16 @@ Sistema de automação e monitoramento de aquário desenvolvido para a disciplin
 
 ---
 
+## Autores
+
+- Gabriel Martins Cortez Veloso
+- Gabriel Patente Tosi Joaquim
+- Luís Eduardo Veloso Nunes Santos
+- Rodrigo Franciso Pettinati Mikaro
+- Thomaz Carleial de Andrade
+
+---
+
 ## Sumário
 
 - [Visão geral](#visão-geral)
