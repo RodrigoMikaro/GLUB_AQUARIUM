@@ -149,8 +149,17 @@ O sistema contempla as seguintes funções principais:
 - aplicativo móvel compatível com os tópicos do projeto;
 - componentes eletrônicos descritos na montagem.
 
-### Passo a passo
+---
+## Material adicional
 
-#### 1. Clonar o repositório
-```bash
-git clone [COLE_AQUI_O_LINK_DO_GITHUB]
+### Repositório GitHub
+
+https://github.com/RodrigoMikaro/GLUB_AQUARIUM
+
+### Pitch inicial
+
+https://youtu.be/c4ZVzafg15c
+
+### Pitch final
+
+[Adicionar link do pitch final]
