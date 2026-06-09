@@ -101,7 +101,7 @@ O fluxo de funcionamento é o seguinte:
 - Sensor de temperatura
 - Sensor de nível d’água
 - Sensor de tensão/corrente
-- Sensor de pH *(previsto no projeto; ver seção de lições aprendidas)*
+- Sensor de pH
 
 ### Atuadores
 - Mini bombas de água
