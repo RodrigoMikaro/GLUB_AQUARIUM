@@ -76,10 +76,9 @@ O fluxo de funcionamento é o seguinte:
 - o ESP32 lê os sensores e controla os atuadores;
 - o estado do sistema pode ser reenviado ao app para acompanhamento.
 
-### siuu
-<!-- inserir aqui a imagem do diagrama em blocos -->
+### Diagrama em Blocos
 
-![Diagrama em blocos do sistema](./imagens/diagrama_blocos.png)
+![Diagrama em blocos do sistema](diagrama_em_blocos.png)
 
 ### Arquitetura
 
