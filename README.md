@@ -24,11 +24,7 @@ Sistema de automação e monitoramento de aquário desenvolvido para a disciplin
 - [Componentes utilizados](#componentes-utilizados)
 - [Funcionalidades](#funcionalidades)
 - [Instalação e execução](#instalação-e-execução)
-- [Material adicional](#material-adicional)
-- [Resultados e testes](#resultados-e-testes)
-- [Custos do projeto](#custos-do-projeto)
-- [Lições aprendidas](#lições-aprendidas)
-- [Equipe](#equipe)
+
 
 ---
 
