@@ -45,12 +45,12 @@ O objetivo do projeto é permitir o controle remoto e a automação das principa
 
 O projeto foi desenvolvido com foco em:
 
-- automatizar funções essenciais de um aquário;
-- permitir controle remoto pelo usuário;
-- centralizar a lógica em um ESP32;
-- utilizar comunicação via MQTT;
-- criar uma solução replicável e de baixo custo relativo;
-- aplicar conceitos de engenharia de computação em um sistema real.
+- Automatizar funções essenciais de um aquário;
+- Permitir controle remoto pelo usuário;
+- Centralizar a lógica em um ESP32;
+- Utilizar comunicação via MQTT;
+- Criar uma solução replicável e de baixo custo relativo;
+- Aplicar conceitos de engenharia de computação em um sistema real.
 
 ---
 
@@ -65,11 +65,11 @@ A arquitetura do sistema é composta por quatro camadas principais:
 
 O fluxo de funcionamento é o seguinte:
 
-- o usuário configura preferências no app;
-- o app publica esses dados no broker MQTT;
-- o ESP32 assina os tópicos necessários e recebe os comandos;
-- o ESP32 lê os sensores e controla os atuadores;
-- o estado do sistema pode ser reenviado ao app para acompanhamento.
+- O usuário configura preferências no app;
+- O app publica esses dados no broker MQTT;
+- O ESP32 assina os tópicos necessários e recebe os comandos;
+- O ESP32 lê os sensores e controla os atuadores;
+- O estado do sistema pode ser reenviado ao app para acompanhamento.
 
 ### Diagrama em Blocos
 
@@ -120,14 +120,14 @@ O fluxo de funcionamento é o seguinte:
 
 O sistema contempla as seguintes funções principais:
 
-- controle da luminosidade do aquário;
-- troca parcial e periódica de água;
-- medição e regulação de temperatura;
-- alimentação regular dos peixes;
-- notificação de falhas e erros do sistema;
-- monitoramento remoto via app;
-- armazenamento e uso de preferências do usuário;
-- operação integrada entre sensores, atuadores e broker MQTT.
+- Controle da luminosidade do aquário;
+- Troca parcial e periódica de água;
+- Medição e regulação de temperatura;
+- Alimentação regular dos peixes;
+- Notificação de falhas e erros do sistema;
+- Monitoramento remoto via app;
+- Armazenamento e uso de preferências do usuário;
+- Operação integrada entre sensores, atuadores e broker MQTT.
 
 ---
 
