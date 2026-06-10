@@ -171,6 +171,12 @@ O sistema utiliza o [HiveMQ Cloud](https://www.hivemq.com/mqtt-cloud-broker/) co
 | `glub1/troca`                 | App → ESP32     | Agendamento de troca de água     |
 | `glub1/troca/agora`           | App → ESP32     | Troca de água imediata           |
 
+> ⚠️ **Aviso de Segurança da Informação**
+> 
+> Para fins estritamente didáticos e para facilitar a avaliação, as credenciais de acesso ao Broker MQTT do HiveMQ foram mantidas temporariamente explícitas nos códigos deste repositório público.
+> 
+> Em um sistema comercial ou de produção real, as credenciais **nunca** seriam expostas no repositório. 
+
 ---
 
 ### 2. Firmware (ESP32)
