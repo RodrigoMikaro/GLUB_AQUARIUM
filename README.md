@@ -25,7 +25,6 @@ Sistema de automação e monitoramento de aquário desenvolvido para a disciplin
 - [Funcionalidades](#funcionalidades)
 - [Instalação e execução](#instalação-e-execução)
 
-
 ---
 
 ## Visão geral
@@ -36,7 +35,7 @@ O **GLUB_AQUARIUM** é um sistema de automação para aquário que integra:
 - **Atuadores** para controle de iluminação, temperatura, circulação e alimentação;
 - **ESP32** como unidade central de controle;
 - **MQTT** para comunicação entre o sistema e o aplicativo;
-- **App móvel** para interação com o usuário.
+- **Web App** para interação e controle pelo usuário, acessível pelo navegador.
 
 O objetivo do projeto é permitir o controle remoto e a automação das principais funções de um aquário, buscando praticidade, organização, segurança e melhor experiência de uso.
 
@@ -60,7 +59,7 @@ O projeto foi desenvolvido com foco em:
 A arquitetura do sistema é composta por quatro camadas principais:
 
 1. **Usuário**
-2. **Aplicativo móvel**
+2. **Web App**
 3. **Broker MQTT**
 4. **ESP32 e circuito eletroeletrônico**
 
@@ -90,29 +89,29 @@ O fluxo de funcionamento é o seguinte:
 
 ### Controle e comunicação
 - ESP32
-- Broker MQTT
-- Aplicativo móvel
+- Broker MQTT (HiveMQ Cloud)
+- Web App Responsivo (Flutter Web)
 
 ### Sensores
-- Sensor de temperatura
-- Sensor de nível d’água
-- Sensor de tensão/corrente
-- Sensor de pH
+- Sensor de temperatura DS18B20
+- Sensor ultrasônico JSN-SR04T (para medir nível de água)
+- Sensor de tensão/corrente INA226
+- Sensor de pH PH-4502C
 
 ### Atuadores
 - Mini bombas de água
 - Fita LED
 - Termostato
 - Ventoinha
-- Servo motor para alimentação
+- Servo motor MG996R para alimentação
 - Servo motor para dosagem/ajuste de pH *(quando aplicável ao protótipo)*
 - Módulos relé
-- Módulo MOSFET
+- Módulo MOSFET IRF520
 
 ### Alimentação
 - Fonte 110 V
 - Fonte colmeia 12 V
-- Regulador step-down 5 V
+- Regulador step-down LM2596 5 V
 - Powerbank como alimentação auxiliar / de contingência
 
 ---
@@ -134,19 +133,76 @@ O sistema contempla as seguintes funções principais:
 
 ## Instalação e execução
 
-> Esta seção deve permitir que outra pessoa consiga reproduzir o projeto.
+Siga os passos abaixo para configurar o ambiente de desenvolvimento, carregar o código no hardware e acessar a interface de controle do sistema.
 
-### Pré-requisitos
+### 1. Broker MQTT (HiveMQ Cloud)
 
-- Arduino IDE ou ambiente compatível com ESP32;
-- placa **ESP32**;
-- acesso à internet;
-- broker MQTT configurado;
-- aplicativo móvel compatível com os tópicos do projeto;
-- componentes eletrônicos descritos na montagem.
+O sistema utiliza o [HiveMQ Cloud](https://www.hivemq.com/mqtt-cloud-broker/) como broker MQTT. A camada gratuita é suficiente para o projeto.
+
+#### Passo a Passo
+
+1. Crie uma conta em [hivemq.com](https://www.hivemq.com/mqtt-cloud-broker/) e acesse o painel.
+2. Crie um novo cluster gratuito (Serverless ou Free Tier).
+3. Na aba **Access Management**, crie um usuário com senha e anote as credenciais.
+4. Na visão geral do cluster, copie o **Host** no formato:
+   ```
+   xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.s1.eu.hivemq.cloud
+   ```
+5. Anote as seguintes informações para uso nas etapas seguintes:
+
+| Parâmetro       | Valor                                        |
+|-----------------|----------------------------------------------|
+| Host            | `<seu-cluster>.s1.eu.hivemq.cloud`           |
+| Porta MQTT/TLS  | `8883` (ESP32)                               |
+| Porta WSS       | `8884` (Web App)                             |
+| Usuário         | `<usuário criado>`                           |
+| Senha           | `<senha criada>`                             |
+
+#### Tópicos utilizados
+
+| Tópico                        | Direção         | Descrição                        |
+|-------------------------------|-----------------|----------------------------------|
+| `glub1/temperatura`           | ESP32 → App     | Leitura de temperatura           |
+| `glub1/voltagem`              | ESP32 → App     | Leitura de tensão/corrente       |
+| `glub1/ph`                    | ESP32 → App     | Leitura de pH                    |
+| `glub1/iluminacao`            | App → ESP32     | Controle da fita LED             |
+| `glub1/alimentacao/frequencia`| App → ESP32     | Frequência de alimentação        |
+| `glub1/alimentacao/agora`     | App → ESP32     | Alimentação imediata             |
+| `glub1/troca`                 | App → ESP32     | Agendamento de troca de água     |
+| `glub1/troca/agora`           | App → ESP32     | Troca de água imediata           |
 
 ---
-## Material adicional
+
+### 2. Firmware (ESP32)
+
+#### Pré-requisitos
+
+- Arduino IDE com suporte às placas ESP32 configurado.
+- Cabo USB para transferência de dados.
+- Biblioteca PubSubClient instalada na IDE para gerenciamento do protocolo MQTT.
+
+#### Passo a Passo
+
+1. Clone este repositório em sua máquina local:
+   ```bash
+   git clone https://github.com/RodrigoMikaro/GLUB_AQUARIUM.git
+   ```
+2. Abra o arquivo principal de código na Arduino IDE.
+3. Insira as credenciais da sua rede local Wi-Fi e os dados do broker HiveMQ nas variáveis correspondentes de configuração do sistema (host, porta `8883`, usuário e senha criados na etapa anterior).
+4. Conecte a placa ESP32 ao computador, selecione a porta correta e realize o upload do código.
+5. Abra o Serial Monitor para acompanhar o status da inicialização e verificar o sucesso da conexão com a rede e com o broker.
+
+---
+
+### 3. Interface (Web App)
+
+A interface de usuário foi desenvolvida como uma aplicação web responsiva em Flutter.
+
+O painel está publicado e disponível para uso imediato pelo link:
+
+[Acessar GLUB_AQUARIUM Web APP](https://merry-kulfi-37783b.netlify.app/)
+
+---
 
 ### Repositório GitHub
 
