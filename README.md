@@ -220,4 +220,4 @@ https://youtu.be/c4ZVzafg15c
 
 ### Pitch final
 
-[Adicionar link do pitch final]
+[Pitch Final Glub](https://youtu.be/8MYzLm-FO54).
