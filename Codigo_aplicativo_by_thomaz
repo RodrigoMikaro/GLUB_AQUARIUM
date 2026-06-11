@@ -1,0 +1,3744 @@
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
+import 'package:fl_chart/fl_chart.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+import 'package:mqtt_client/mqtt_browser_client.dart';
+import 'package:mqtt_client/mqtt_client.dart';
+import 'package:table_calendar/table_calendar.dart';
+
+final DatabaseReference _dbRef = FirebaseDatabase.instance.ref();
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(
+    options: const FirebaseOptions(
+      apiKey: "AIzaSyAAX_astxvqq0s1sYz6unmbI_6jScP88rE",
+      authDomain: "glub-d38fb.firebaseapp.com",
+      databaseURL: "https://glub-d38fb-default-rtdb.firebaseio.com",
+      projectId: "glub-d38fb",
+      storageBucket: "glub-d38fb.firebasestorage.app",
+      messagingSenderId: "477783465966",
+      appId: "1:477783465966:web:8cc380902798702d11f8ff",
+      measurementId: "G-EGX59YDW94",
+    ),
+  );
+  runApp(const GlubApp());
+}
+
+class GlubApp extends StatelessWidget {
+  const GlubApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      title: 'Glub',
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF031B29),
+        textTheme: GoogleFonts.interTextTheme(ThemeData.dark().textTheme),
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFF00D1FF),
+          secondary: Color(0xFF00D1FF),
+        ),
+      ),
+      home: const DashboardPage(),
+    );
+  }
+}
+
+// ======================================================
+// SERVIÇO MQTT
+// ======================================================
+
+class MQTTService {
+  late MqttBrowserClient client;
+  Function(double temp)? onTemperatura;
+  Function(double volts)? onVoltagem;
+  Function(double ph)? onPh;
+  Function(bool conectado)? onEsp32Status;
+
+  static const String _host =
+      'wss://0e6bf66e693b43c2a87b5cd707fe5647.s1.eu.hivemq.cloud/mqtt';
+  static const int _port = 8884;
+  static const String _username = 'glub1';
+  static const String _password = 'GlubAquarium1';
+  static const String _topicoTemp = 'glub1/temperatura';
+  static const String _topicoVolt = 'glub1/voltagem';
+  static const String _topicoPh = 'glub1/ph';
+  static const String _topicoAlimentacaoFreq = 'glub1/alimentacao/frequencia';
+  static const String _topicoAlimentacaoAgora = 'glub1/alimentacao/agora';
+  static const String _topicoTroca = 'glub1/troca';
+  static const String _topicoTrocaAgora = 'glub1/troca/agora';
+  static const String _topicoLed = 'glub1/iluminacao';
+  static const String _topicoTempAgr = 'glub1/temperatura/set';
+  bool get isConnected =>
+      client.connectionStatus?.state == MqttConnectionState.connected;
+
+  Future<void> connect() async {
+    client = MqttBrowserClient.withPort(_host, 'glub_flutter', _port);
+    client.keepAlivePeriod = 20;
+    client.logging(on: true);
+    client.setProtocolV311();
+
+    final connMess = MqttConnectMessage()
+        .withClientIdentifier(
+            'glub_flutter_${DateTime.now().millisecondsSinceEpoch}')
+        .authenticateAs(_username, _password)
+        .startClean();
+
+    client.connectionMessage = connMess;
+
+    try {
+      await client.connect();
+    } catch (e) {
+      debugPrint('MQTT erro de conexão: $e');
+      client.disconnect();
+      return;
+    }
+
+    if (isConnected) {
+      debugPrint('MQTT conectado ao HiveMQ');
+      _assinar();
+    } else {
+      debugPrint('MQTT falhou: ${client.connectionStatus}');
+    }
+  }
+
+  void _assinar() {
+    client.subscribe(_topicoTemp, MqttQos.atLeastOnce);
+    client.subscribe(_topicoVolt, MqttQos.atLeastOnce);
+    client.subscribe(_topicoPh, MqttQos.atLeastOnce);
+
+    client.updates!.listen((mensagens) {
+      final msg = mensagens[0];
+      final topico = msg.topic;
+      final recMess = msg.payload as MqttPublishMessage;
+      final payload = MqttPublishPayload.bytesToStringAsString(
+        recMess.payload.message,
+      ).trim();
+
+      debugPrint('MQTT [$topico] payload: $payload');
+
+      onEsp32Status?.call(true);
+
+      try {
+        final valor = double.parse(payload);
+        if (topico == "glub1/temperatura") {
+          if (onTemperatura != null) onTemperatura!(valor);
+          _dbRef.child("glub1/temperatura_atual").set(valor);
+        } else if (topico == "glub1/voltagem") {
+          if (onVoltagem != null) onVoltagem!(valor);
+          _dbRef.child("glub1/voltagem_atual").set(valor);
+        } else if (topico == "glub1/ph") {
+          if (onPh != null) onPh!(valor);
+          _dbRef.child("glub1/ph_atual").set(valor);
+        }
+      } catch (e) {
+        debugPrint('Erro ao parsear payload MQTT: $e — payload: $payload');
+      }
+    });
+  }
+
+  void publicarFrequenciaAlimentacao(int vezesPorDia) {
+    if (!isConnected) return;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString('$vezesPorDia');
+    client.publishMessage(
+        _topicoAlimentacaoFreq, MqttQos.atLeastOnce, builder.payload!);
+  }
+  void publicarTemperatura(double tempIdeal) {
+    if (!isConnected) return;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString('$tempIdeal');
+    client.publishMessage(
+        _topicoTempAgr, MqttQos.atLeastOnce, builder.payload!);
+  }
+
+  void publicarAlimentacaoAgora() {
+    if (!isConnected) return;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString('1');
+    client.publishMessage(
+        _topicoAlimentacaoAgora, MqttQos.atLeastOnce, builder.payload!);
+  }
+
+  void publicarFrequenciaTroca(int vezesPorMes) {
+    if (!isConnected) return;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString('$vezesPorMes');
+    client.publishMessage(
+        _topicoTroca, MqttQos.atLeastOnce, builder.payload!);
+  }
+
+  void publicarTrocaAgora() {
+    if (!isConnected) return;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString('1');
+    client.publishMessage(
+        _topicoTrocaAgora, MqttQos.atLeastOnce, builder.payload!);
+  }
+
+  void publicarLed(int intensidade) {
+    if (!isConnected) return;
+    final builder = MqttClientPayloadBuilder();
+    builder.addString('$intensidade');
+    client.publishMessage(
+        _topicoLed, MqttQos.atLeastOnce, builder.payload!);
+  }
+
+  void desconectar() => client.disconnect();
+}
+
+// ======================================================
+// MODELOS
+// ======================================================
+
+class ItemAlerta {
+  final String titulo;
+  final String descricao;
+  final String tempo;
+  final TipoAlerta tipo;
+
+  const ItemAlerta({
+    required this.titulo,
+    required this.descricao,
+    required this.tempo,
+    required this.tipo,
+  });
+}
+
+enum TipoAlerta { critico, aviso, info }
+
+class LeituraTemp {
+  final double valor;
+  final DateTime horario;
+
+  LeituraTemp({required this.valor, required this.horario});
+}
+
+class LeituraPh {
+  final double valor;
+  final DateTime horario;
+
+  LeituraPh({required this.valor, required this.horario});
+}
+
+class LeituraDiaria {
+  final double mediaManha;
+  final double mediaTarde;
+  final double mediaNoite;
+  final DateTime dia;
+
+  LeituraDiaria({
+    required this.mediaManha,
+    required this.mediaTarde,
+    required this.mediaNoite,
+    required this.dia,
+  });
+}
+
+// NOVO: histórico semanal de pH (mesma estrutura)
+class LeituraDiariaPh {
+  final double mediaManha;
+  final double mediaTarde;
+  final double mediaNoite;
+  final DateTime dia;
+
+  LeituraDiariaPh({
+    required this.mediaManha,
+    required this.mediaTarde,
+    required this.mediaNoite,
+    required this.dia,
+  });
+}
+
+class TarefaCalendario {
+  String nome;
+  bool concluida;
+  // NOVO: indica se é tarefa criada pelo usuário (persiste separado)
+  bool isUsuario;
+
+  TarefaCalendario({
+    required this.nome,
+    this.concluida = false,
+    this.isUsuario = false,
+  });
+}
+
+// ======================================================
+// DASHBOARD
+// ======================================================
+
+class DashboardPage extends StatefulWidget {
+  const DashboardPage({super.key});
+
+  @override
+  State<DashboardPage> createState() => _DashboardPageState();
+}
+
+class _DashboardPageState extends State<DashboardPage> {
+  final mqtt = MQTTService();
+
+  int? intensidadeLed;
+  final TextEditingController _ctrlLed = TextEditingController();
+
+  int? frequenciaAlimentacao;
+  final TextEditingController _ctrlAlimentacao = TextEditingController();
+  bool modoAlimentacao = false;
+  DateTime? ultimaAlimentacao;
+
+  int? frequenciaTrocaMes;
+  final TextEditingController _ctrlTrocaMes = TextEditingController();
+  bool modoTrocaAgua = false;
+  DateTime? ultimaTrocaAgua;
+
+  // NOVO: temperatura ideal configurável pelo usuário
+  double? tempIdeal;
+  final TextEditingController _ctrlTempIdeal = TextEditingController();
+
+  double temperaturaAtual = 0;
+  double temperaturaInstantanea = 0;
+  DateTime? ultimaAtualizacaoTemp;
+
+  double voltagemInstantanea = 0;
+  DateTime? ultimaAtualizacaoVolt;
+
+  double phInstantaneo = 0;
+  DateTime? ultimaAtualizacaoPh;
+  final List<LeituraPh> _historicoPh = [];
+  DateTime? _ultimaLeituraHistoricoPh;
+
+  bool esp32Conectado = false;
+  DateTime? ultimaMensagemEsp32;
+
+  final List<LeituraTemp> _historicoTemp = [];
+  DateTime? _ultimaLeituraHistorico;
+
+  final List<LeituraDiaria> _historicoSemanal = [];
+  final List<double> _bufferManha = [];
+  final List<double> _bufferTarde = [];
+  final List<double> _bufferNoite = [];
+  String _diaAtualBuffers = '';
+
+  // NOVO: histórico semanal de pH
+  final List<LeituraDiariaPh> _historicoSemanalPh = [];
+  final List<double> _bufferPhManha = [];
+  final List<double> _bufferPhTarde = [];
+  final List<double> _bufferPhNoite = [];
+  String _diaAtualBuffersPh = '';
+
+  int diasParaTroca = 7;
+  DateTime proximaTroca = DateTime.now().add(const Duration(days: 7));
+
+  DateTime _focusedDay = DateTime.now();
+  DateTime diaSelecionado = DateTime.now();
+
+  Map<DateTime, List<TarefaCalendario>> tarefas = {
+    DateTime.utc(2026, 5, 31): [
+      TarefaCalendario(nome: "Troca de água"),
+      TarefaCalendario(nome: "Limpeza do filtro"),
+    ],
+  };
+
+  // ======================================================
+  // HELPERS DE TEMPERATURA IDEAL
+  // ======================================================
+
+  double get _tempMin => tempIdeal != null ? tempIdeal! - 2.5 : 24.0;
+  double get _tempMax => tempIdeal != null ? tempIdeal! + 2.5 : 28.0;
+
+  String get _subtituloTempIdeal =>
+      "Ideal: ${_tempMin.toStringAsFixed(1)} °C – ${_tempMax.toStringAsFixed(1)} °C";
+
+  Color _corTemperatura(double temp) {
+    if (temp == 0) return const Color(0xFF00D1FF);
+    if (temp < _tempMin) return Colors.blueAccent;
+    if (temp > _tempMax) return Colors.deepOrangeAccent;
+    return const Color(0xFF00D1FF);
+  }
+
+  // ======================================================
+  // INIT STATE
+  // ======================================================
+
+  @override
+  void initState() {
+    super.initState();
+
+    _atualizarDatasDeNocalendario(7);
+    _carregarDadosIniciais();
+
+    mqtt.onTemperatura = (temp) {
+      final agora = DateTime.now();
+      setState(() {
+        temperaturaInstantanea = temp;
+        ultimaAtualizacaoTemp = agora;
+        temperaturaAtual = temp;
+
+        if (_ultimaLeituraHistorico == null ||
+            agora.difference(_ultimaLeituraHistorico!).inMinutes >= 20) {
+          _historicoTemp.add(LeituraTemp(valor: temp, horario: agora));
+          _ultimaLeituraHistorico = agora;
+          if (_historicoTemp.length > 36) _historicoTemp.removeAt(0);
+          _salvarLeituraHistorico(temp, agora);
+        }
+
+        final chaveHoje = _chaveData(agora);
+        if (_diaAtualBuffers.isNotEmpty && _diaAtualBuffers != chaveHoje) {
+          _bufferManha.clear();
+          _bufferTarde.clear();
+          _bufferNoite.clear();
+        }
+        _diaAtualBuffers = chaveHoje;
+
+        final hora = agora.hour;
+        final String periodo;
+        if (hora < 8) {
+          _bufferManha.add(temp);
+          periodo = 'manha';
+        } else if (hora < 16) {
+          _bufferTarde.add(temp);
+          periodo = 'tarde';
+        } else {
+          _bufferNoite.add(temp);
+          periodo = 'noite';
+        }
+
+        final ts = agora.millisecondsSinceEpoch.toString();
+        _dbRef
+            .child('glub1/leituras_brutas/$chaveHoje/$periodo/$ts')
+            .set(temp);
+
+        _atualizarHistoricoSemanal(agora);
+      });
+    };
+
+    mqtt.onVoltagem = (volts) {
+      setState(() {
+        voltagemInstantanea = volts;
+        ultimaAtualizacaoVolt = DateTime.now();
+      });
+    };
+
+    mqtt.onPh = (ph) {
+      final agora = DateTime.now();
+      setState(() {
+        phInstantaneo = ph;
+        ultimaAtualizacaoPh = agora;
+
+        if (_ultimaLeituraHistoricoPh == null ||
+            agora.difference(_ultimaLeituraHistoricoPh!).inMinutes >= 20) {
+          _historicoPh.add(LeituraPh(valor: ph, horario: agora));
+          _ultimaLeituraHistoricoPh = agora;
+          if (_historicoPh.length > 36) _historicoPh.removeAt(0);
+          _salvarLeituraHistoricoPh(ph, agora);
+        }
+
+        // NOVO: buffers semanais de pH
+        final chaveHoje = _chaveData(agora);
+        if (_diaAtualBuffersPh.isNotEmpty && _diaAtualBuffersPh != chaveHoje) {
+          _bufferPhManha.clear();
+          _bufferPhTarde.clear();
+          _bufferPhNoite.clear();
+        }
+        _diaAtualBuffersPh = chaveHoje;
+
+        final hora = agora.hour;
+        final String periodo;
+        if (hora < 8) {
+          _bufferPhManha.add(ph);
+          periodo = 'manha';
+        } else if (hora < 16) {
+          _bufferPhTarde.add(ph);
+          periodo = 'tarde';
+        } else {
+          _bufferPhNoite.add(ph);
+          periodo = 'noite';
+        }
+
+        final ts = agora.millisecondsSinceEpoch.toString();
+        _dbRef
+            .child('glub1/leituras_brutas_ph/$chaveHoje/$periodo/$ts')
+            .set(ph);
+
+        _atualizarHistoricoSemanalPh(agora);
+      });
+    };
+
+    mqtt.onEsp32Status = (conectado) {
+      setState(() {
+        esp32Conectado = conectado;
+        ultimaMensagemEsp32 = DateTime.now();
+      });
+      Future.delayed(const Duration(seconds: 60), () {
+        if (mounted) {
+          final agora = DateTime.now();
+          if (ultimaMensagemEsp32 != null &&
+              agora.difference(ultimaMensagemEsp32!).inSeconds >= 60) {
+            setState(() => esp32Conectado = false);
+          }
+        }
+      });
+    };
+
+    mqtt.connect();
+  }
+
+  // ======================================================
+  // HELPER: chave de data
+  // ======================================================
+
+  String _chaveData(DateTime dt) =>
+      '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+
+  // ======================================================
+  // CARREGA DADOS INICIAIS DO FIREBASE
+  // ======================================================
+
+  Future<void> _carregarDadosIniciais() async {
+    try {
+      final snapTemp = await _dbRef.child('glub1/temperatura_atual').get();
+      final snapVolt = await _dbRef.child('glub1/voltagem_atual').get();
+      final snapPh = await _dbRef.child('glub1/ph_atual').get();
+
+      if (snapTemp.exists && snapTemp.value != null) {
+        final temp = (snapTemp.value as num).toDouble();
+        setState(() {
+          temperaturaAtual = temp;
+          temperaturaInstantanea = temp;
+        });
+      }
+
+      if (snapVolt.exists && snapVolt.value != null) {
+        final volt = (snapVolt.value as num).toDouble();
+        setState(() => voltagemInstantanea = volt);
+      }
+
+      if (snapPh.exists && snapPh.value != null) {
+        final ph = (snapPh.value as num).toDouble();
+        setState(() => phInstantaneo = ph);
+      }
+
+      // Histórico intraday de temperatura
+      final snapHistorico = await _dbRef
+          .child('glub1/historico_temp')
+          .orderByKey()
+          .limitToLast(36)
+          .get();
+
+      if (snapHistorico.exists && snapHistorico.value != null) {
+        final Map<dynamic, dynamic> dados =
+            snapHistorico.value as Map<dynamic, dynamic>;
+        final leituras = dados.entries.map((e) {
+          final ts = int.tryParse(e.key.toString()) ?? 0;
+          final valor = (e.value as num).toDouble();
+          return LeituraTemp(
+            valor: valor,
+            horario: DateTime.fromMillisecondsSinceEpoch(ts),
+          );
+        }).toList();
+        leituras.sort((a, b) => a.horario.compareTo(b.horario));
+        setState(() {
+          _historicoTemp.clear();
+          _historicoTemp.addAll(leituras);
+          if (_historicoTemp.isNotEmpty) {
+            _ultimaLeituraHistorico = _historicoTemp.last.horario;
+          }
+        });
+      }
+
+      // Histórico intraday de pH
+      final snapHistoricoPh = await _dbRef
+          .child('glub1/historico_ph')
+          .orderByKey()
+          .limitToLast(36)
+          .get();
+
+      if (snapHistoricoPh.exists && snapHistoricoPh.value != null) {
+        final Map<dynamic, dynamic> dados =
+            snapHistoricoPh.value as Map<dynamic, dynamic>;
+        final leituras = dados.entries.map((e) {
+          final ts = int.tryParse(e.key.toString()) ?? 0;
+          final valor = (e.value as num).toDouble();
+          return LeituraPh(
+            valor: valor,
+            horario: DateTime.fromMillisecondsSinceEpoch(ts),
+          );
+        }).toList();
+        leituras.sort((a, b) => a.horario.compareTo(b.horario));
+        setState(() {
+          _historicoPh.clear();
+          _historicoPh.addAll(leituras);
+          if (_historicoPh.isNotEmpty) {
+            _ultimaLeituraHistoricoPh = _historicoPh.last.horario;
+          }
+        });
+      }
+
+      // Histórico semanal de temperatura
+      final snapSemanal = await _dbRef
+          .child('glub1/historico_semanal')
+          .orderByKey()
+          .limitToLast(7)
+          .get();
+
+      if (snapSemanal.exists && snapSemanal.value != null) {
+        final Map<dynamic, dynamic> dados =
+            snapSemanal.value as Map<dynamic, dynamic>;
+        final List<LeituraDiaria> leiturasSemana = [];
+        for (final entry in dados.entries) {
+          final partes = entry.key.toString().split('-');
+          if (partes.length != 3) continue;
+          final dia = DateTime.utc(
+            int.parse(partes[0]),
+            int.parse(partes[1]),
+            int.parse(partes[2]),
+          );
+          final periodos = entry.value as Map<dynamic, dynamic>;
+          leiturasSemana.add(LeituraDiaria(
+            dia: dia,
+            mediaManha: (periodos['manha'] as num?)?.toDouble() ?? 0,
+            mediaTarde: (periodos['tarde'] as num?)?.toDouble() ?? 0,
+            mediaNoite: (periodos['noite'] as num?)?.toDouble() ?? 0,
+          ));
+        }
+        leiturasSemana.sort((a, b) => a.dia.compareTo(b.dia));
+        setState(() {
+          _historicoSemanal.clear();
+          _historicoSemanal.addAll(leiturasSemana);
+        });
+      }
+
+      // NOVO: histórico semanal de pH
+      final snapSemanalPh = await _dbRef
+          .child('glub1/historico_semanal_ph')
+          .orderByKey()
+          .limitToLast(7)
+          .get();
+
+      if (snapSemanalPh.exists && snapSemanalPh.value != null) {
+        final Map<dynamic, dynamic> dados =
+            snapSemanalPh.value as Map<dynamic, dynamic>;
+        final List<LeituraDiariaPh> leiturasSemana = [];
+        for (final entry in dados.entries) {
+          final partes = entry.key.toString().split('-');
+          if (partes.length != 3) continue;
+          final dia = DateTime.utc(
+            int.parse(partes[0]),
+            int.parse(partes[1]),
+            int.parse(partes[2]),
+          );
+          final periodos = entry.value as Map<dynamic, dynamic>;
+          leiturasSemana.add(LeituraDiariaPh(
+            dia: dia,
+            mediaManha: (periodos['manha'] as num?)?.toDouble() ?? 0,
+            mediaTarde: (periodos['tarde'] as num?)?.toDouble() ?? 0,
+            mediaNoite: (periodos['noite'] as num?)?.toDouble() ?? 0,
+          ));
+        }
+        leiturasSemana.sort((a, b) => a.dia.compareTo(b.dia));
+        setState(() {
+          _historicoSemanalPh.clear();
+          _historicoSemanalPh.addAll(leiturasSemana);
+        });
+      }
+
+      // Restaurar buffers de temperatura do dia atual
+      final hoje = DateTime.now();
+      final chaveHoje = _chaveData(hoje);
+
+      final snapBrutos = await _dbRef
+          .child('glub1/leituras_brutas/$chaveHoje')
+          .get();
+
+      if (snapBrutos.exists && snapBrutos.value != null) {
+        final periodos = snapBrutos.value as Map<dynamic, dynamic>;
+        void carregarPeriodo(String periodo, List<double> buffer) {
+          if (periodos[periodo] == null) return;
+          final leituras = periodos[periodo] as Map<dynamic, dynamic>;
+          for (final v in leituras.values) {
+            buffer.add((v as num).toDouble());
+          }
+        }
+        setState(() {
+          _diaAtualBuffers = chaveHoje;
+          carregarPeriodo('manha', _bufferManha);
+          carregarPeriodo('tarde', _bufferTarde);
+          carregarPeriodo('noite', _bufferNoite);
+        });
+        _atualizarHistoricoSemanal(hoje);
+      }
+
+      // NOVO: restaurar buffers de pH do dia atual
+      final snapBrutosPh = await _dbRef
+          .child('glub1/leituras_brutas_ph/$chaveHoje')
+          .get();
+
+      if (snapBrutosPh.exists && snapBrutosPh.value != null) {
+        final periodos = snapBrutosPh.value as Map<dynamic, dynamic>;
+        void carregarPeriodo(String periodo, List<double> buffer) {
+          if (periodos[periodo] == null) return;
+          final leituras = periodos[periodo] as Map<dynamic, dynamic>;
+          for (final v in leituras.values) {
+            buffer.add((v as num).toDouble());
+          }
+        }
+        setState(() {
+          _diaAtualBuffersPh = chaveHoje;
+          carregarPeriodo('manha', _bufferPhManha);
+          carregarPeriodo('tarde', _bufferPhTarde);
+          carregarPeriodo('noite', _bufferPhNoite);
+        });
+        _atualizarHistoricoSemanalPh(hoje);
+      }
+
+      // Limpar leituras brutas de temp antigas (>7 dias)
+      final corte = hoje.subtract(const Duration(days: 7));
+      final chaveCorte = _chaveData(corte);
+      final snapBrutosAntigos = await _dbRef
+          .child('glub1/leituras_brutas')
+          .orderByKey()
+          .endBefore(chaveCorte)
+          .get();
+      if (snapBrutosAntigos.exists && snapBrutosAntigos.value != null) {
+        final antigos = snapBrutosAntigos.value as Map<dynamic, dynamic>;
+        for (final chave in antigos.keys) {
+          _dbRef.child('glub1/leituras_brutas/$chave').remove();
+        }
+      }
+
+      // NOVO: limpar leituras brutas de pH antigas (>7 dias)
+      final snapBrutosPhAntigos = await _dbRef
+          .child('glub1/leituras_brutas_ph')
+          .orderByKey()
+          .endBefore(chaveCorte)
+          .get();
+      if (snapBrutosPhAntigos.exists && snapBrutosPhAntigos.value != null) {
+        final antigos = snapBrutosPhAntigos.value as Map<dynamic, dynamic>;
+        for (final chave in antigos.keys) {
+          _dbRef.child('glub1/leituras_brutas_ph/$chave').remove();
+        }
+      }
+
+      final snapAlim =
+          await _dbRef.child('glub1/acionamentos/alimentacao').get();
+      if (snapAlim.exists && snapAlim.value != null) {
+        final ts = (snapAlim.value as num).toInt();
+        setState(() =>
+            ultimaAlimentacao = DateTime.fromMillisecondsSinceEpoch(ts));
+      }
+
+      final snapTroca =
+          await _dbRef.child('glub1/acionamentos/troca_agua').get();
+      if (snapTroca.exists && snapTroca.value != null) {
+        final ts = (snapTroca.value as num).toInt();
+        setState(
+            () => ultimaTrocaAgua = DateTime.fromMillisecondsSinceEpoch(ts));
+      }
+
+      // Carregar configs salvas
+      final snapLed = await _dbRef.child('glub1/config/intensidade_led').get();
+      if (snapLed.exists && snapLed.value != null) {
+        final v = (snapLed.value as num).toInt();
+        setState(() {
+          intensidadeLed = v;
+          _ctrlLed.text = '$v';
+        });
+      }
+
+      final snapAlimFreq =
+          await _dbRef.child('glub1/config/frequencia_alimentacao').get();
+      if (snapAlimFreq.exists && snapAlimFreq.value != null) {
+        final v = (snapAlimFreq.value as num).toInt();
+        setState(() {
+          frequenciaAlimentacao = v;
+          _ctrlAlimentacao.text = '$v';
+        });
+      }
+      final snapTrocaMes =
+          await _dbRef.child('glub1/config/frequencia_troca_mes').get();
+      if (snapTrocaMes.exists && snapTrocaMes.value != null) {
+        final v = (snapTrocaMes.value as num).toInt();
+        setState(() {
+          frequenciaTrocaMes = v;
+          _ctrlTrocaMes.text = '$v';
+          if (v > 0) {
+            final diasEntreTrocas = (30 / v).round();
+            diasParaTroca = diasEntreTrocas;
+            proximaTroca =
+                DateTime.now().add(Duration(days: diasEntreTrocas));
+            _atualizarDatasDeNocalendario(diasEntreTrocas);
+          }
+        });
+      }
+
+      // NOVO: carregar temperatura ideal salva
+      final snapTempIdeal =
+          await _dbRef.child('glub1/temperatura/set').get();
+      if (snapTempIdeal.exists && snapTempIdeal.value != null) {
+        final v = (snapTempIdeal.value as num).toDouble();
+        setState(() {
+          tempIdeal = v;
+          _ctrlTempIdeal.text = '$v';
+        });
+      }
+
+      // Carregar tarefas concluídas
+      final snapTarefas =
+          await _dbRef.child('glub1/tarefas_concluidas').get();
+      if (snapTarefas.exists && snapTarefas.value != null) {
+        final Map<dynamic, dynamic> dados =
+            snapTarefas.value as Map<dynamic, dynamic>;
+        setState(() {
+          for (final entry in dados.entries) {
+            final partes = entry.key.toString().split('-');
+            if (partes.length != 3) continue;
+            final chave = DateTime.utc(
+              int.parse(partes[0]),
+              int.parse(partes[1]),
+              int.parse(partes[2]),
+            );
+            final nomesConcluidos = List<String>.from(
+              (entry.value as Map<dynamic, dynamic>)
+                  .values
+                  .map((v) => v.toString()),
+            );
+            if (tarefas[chave] != null) {
+              for (final tarefa in tarefas[chave]!) {
+                if (nomesConcluidos.contains(tarefa.nome)) {
+                  tarefa.concluida = true;
+                }
+              }
+            }
+            for (final nome in nomesConcluidos) {
+              final jaExiste =
+                  tarefas[chave]?.any((t) => t.nome == nome) ?? false;
+              if (!jaExiste) {
+                tarefas.putIfAbsent(chave, () => []);
+                tarefas[chave]!
+                    .add(TarefaCalendario(nome: nome, concluida: true));
+              }
+            }
+          }
+        });
+      }
+
+      // NOVO: carregar tarefas criadas pelo usuário
+      await _carregarTarefasUsuario();
+    } catch (e) {
+      debugPrint('Erro ao carregar dados do Firebase: $e');
+    }
+  }
+
+  // ======================================================
+  // NOVO: CARREGAR TAREFAS DO USUÁRIO DO FIREBASE
+  // ======================================================
+
+  Future<void> _carregarTarefasUsuario() async {
+    try {
+      final snap = await _dbRef.child('glub1/tarefas_usuario').get();
+      if (!snap.exists || snap.value == null) return;
+
+      final Map<dynamic, dynamic> dados =
+          snap.value as Map<dynamic, dynamic>;
+
+      setState(() {
+        for (final entry in dados.entries) {
+          final partes = entry.key.toString().split('-');
+          if (partes.length != 3) continue;
+          final chave = DateTime.utc(
+            int.parse(partes[0]),
+            int.parse(partes[1]),
+            int.parse(partes[2]),
+          );
+
+          final tarefasMap = entry.value as Map<dynamic, dynamic>;
+          for (final t in tarefasMap.values) {
+            final tMap = t as Map<dynamic, dynamic>;
+            final nome = tMap['nome']?.toString() ?? '';
+            final concluida = tMap['concluida'] == true;
+            if (nome.isEmpty) continue;
+
+            final jaExiste = tarefas[chave]?.any((x) => x.nome == nome) ?? false;
+            if (!jaExiste) {
+              tarefas.putIfAbsent(chave, () => []);
+              tarefas[chave]!.add(TarefaCalendario(
+                nome: nome,
+                concluida: concluida,
+                isUsuario: true,
+              ));
+            }
+          }
+        }
+      });
+    } catch (e) {
+      debugPrint('Erro ao carregar tarefas do usuário: $e');
+    }
+  }
+
+  // ======================================================
+  // NOVO: SALVAR TAREFAS DO USUÁRIO NO FIREBASE
+  // ======================================================
+
+  void _salvarTarefasUsuario(DateTime dia) {
+    final chave = _chaveData(dia);
+    final diaNormalizado = DateTime.utc(dia.year, dia.month, dia.day);
+    final tarefasUsuario = tarefas[diaNormalizado]
+            ?.where((t) => t.isUsuario)
+            .toList() ??
+        [];
+
+    if (tarefasUsuario.isEmpty) {
+      _dbRef.child('glub1/tarefas_usuario/$chave').remove();
+      return;
+    }
+
+    final Map<String, Map<String, dynamic>> dados = {};
+    for (int i = 0; i < tarefasUsuario.length; i++) {
+      dados['$i'] = {
+        'nome': tarefasUsuario[i].nome,
+        'concluida': tarefasUsuario[i].concluida,
+      };
+    }
+    _dbRef.child('glub1/tarefas_usuario/$chave').set(dados);
+  }
+
+  // ======================================================
+  // SALVA LEITURA INDIVIDUAL NO HISTÓRICO
+  // ======================================================
+
+  void _salvarLeituraHistorico(double temp, DateTime horario) {
+    final ts = horario.millisecondsSinceEpoch.toString();
+    _dbRef.child('glub1/historico_temp/$ts').set(temp);
+  }
+
+  void _salvarLeituraHistoricoPh(double ph, DateTime horario) {
+    final ts = horario.millisecondsSinceEpoch.toString();
+    _dbRef.child('glub1/historico_ph/$ts').set(ph);
+  }
+
+  // ======================================================
+  // SALVA TAREFAS CONCLUÍDAS
+  // ======================================================
+
+  void _salvarTarefasConcluidas(DateTime dia) {
+    final chave = _chaveData(dia);
+    final diaNormalizado = DateTime.utc(dia.year, dia.month, dia.day);
+    final concluidas =
+        tarefas[diaNormalizado]?.where((t) => t.concluida).toList() ?? [];
+
+    if (concluidas.isEmpty) {
+      _dbRef.child('glub1/tarefas_concluidas/$chave').remove();
+      return;
+    }
+
+    final Map<String, String> dados = {};
+    for (int i = 0; i < concluidas.length; i++) {
+      dados['$i'] = concluidas[i].nome;
+    }
+    _dbRef.child('glub1/tarefas_concluidas/$chave').set(dados);
+
+    // Atualiza status de concluída nas tarefas de usuário também
+    _salvarTarefasUsuario(dia);
+  }
+
+  // ======================================================
+  // ATUALIZA HISTÓRICO SEMANAL DE TEMPERATURA
+  // ======================================================
+
+  void _atualizarHistoricoSemanal(DateTime agora) {
+    final diaAtual = DateTime(agora.year, agora.month, agora.day);
+    final idx = _historicoSemanal.indexWhere((l) =>
+        l.dia.year == diaAtual.year &&
+        l.dia.month == diaAtual.month &&
+        l.dia.day == diaAtual.day);
+
+    final double? mediaManha = _bufferManha.isNotEmpty
+        ? _bufferManha.reduce((a, b) => a + b) / _bufferManha.length
+        : null;
+    final double? mediaTarde = _bufferTarde.isNotEmpty
+        ? _bufferTarde.reduce((a, b) => a + b) / _bufferTarde.length
+        : null;
+    final double? mediaNoite = _bufferNoite.isNotEmpty
+        ? _bufferNoite.reduce((a, b) => a + b) / _bufferNoite.length
+        : null;
+
+    final existente = idx >= 0 ? _historicoSemanal[idx] : null;
+
+    final novaLeitura = LeituraDiaria(
+      mediaManha: mediaManha ?? existente?.mediaManha ?? 0,
+      mediaTarde: mediaTarde ?? existente?.mediaTarde ?? 0,
+      mediaNoite: mediaNoite ?? existente?.mediaNoite ?? 0,
+      dia: diaAtual,
+    );
+
+    if (idx >= 0) {
+      _historicoSemanal[idx] = novaLeitura;
+    } else {
+      _historicoSemanal.add(novaLeitura);
+      if (_historicoSemanal.length > 7) _historicoSemanal.removeAt(0);
+    }
+
+    final chave = _chaveData(diaAtual);
+    final Map<String, double> dadosSalvar = {};
+    if (mediaManha != null) dadosSalvar['manha'] = mediaManha;
+    if (mediaTarde != null) dadosSalvar['tarde'] = mediaTarde;
+    if (mediaNoite != null) dadosSalvar['noite'] = mediaNoite;
+    if (dadosSalvar.isNotEmpty) {
+      _dbRef.child('glub1/historico_semanal/$chave').update(dadosSalvar);
+    }
+  }
+
+  // NOVO: atualiza histórico semanal de pH
+  void _atualizarHistoricoSemanalPh(DateTime agora) {
+    final diaAtual = DateTime(agora.year, agora.month, agora.day);
+    final idx = _historicoSemanalPh.indexWhere((l) =>
+        l.dia.year == diaAtual.year &&
+        l.dia.month == diaAtual.month &&
+        l.dia.day == diaAtual.day);
+
+    final double? mediaManha = _bufferPhManha.isNotEmpty
+        ? _bufferPhManha.reduce((a, b) => a + b) / _bufferPhManha.length
+        : null;
+    final double? mediaTarde = _bufferPhTarde.isNotEmpty
+        ? _bufferPhTarde.reduce((a, b) => a + b) / _bufferPhTarde.length
+        : null;
+    final double? mediaNoite = _bufferPhNoite.isNotEmpty
+        ? _bufferPhNoite.reduce((a, b) => a + b) / _bufferPhNoite.length
+        : null;
+
+    final existente = idx >= 0 ? _historicoSemanalPh[idx] : null;
+
+    final novaLeitura = LeituraDiariaPh(
+      mediaManha: mediaManha ?? existente?.mediaManha ?? 0,
+      mediaTarde: mediaTarde ?? existente?.mediaTarde ?? 0,
+      mediaNoite: mediaNoite ?? existente?.mediaNoite ?? 0,
+      dia: diaAtual,
+    );
+
+    if (idx >= 0) {
+      _historicoSemanalPh[idx] = novaLeitura;
+    } else {
+      _historicoSemanalPh.add(novaLeitura);
+      if (_historicoSemanalPh.length > 7) _historicoSemanalPh.removeAt(0);
+    }
+
+    final chave = _chaveData(diaAtual);
+    final Map<String, double> dadosSalvar = {};
+    if (mediaManha != null) dadosSalvar['manha'] = mediaManha;
+    if (mediaTarde != null) dadosSalvar['tarde'] = mediaTarde;
+    if (mediaNoite != null) dadosSalvar['noite'] = mediaNoite;
+    if (dadosSalvar.isNotEmpty) {
+      _dbRef.child('glub1/historico_semanal_ph/$chave').update(dadosSalvar);
+    }
+  }
+
+  @override
+  void dispose() {
+    _ctrlLed.dispose();
+    _ctrlAlimentacao.dispose();
+    _ctrlTrocaMes.dispose();
+    _ctrlTempIdeal.dispose();
+    mqtt.desconectar();
+    super.dispose();
+  }
+
+  // ======================================================
+  // HELPERS CALENDÁRIO
+  // ======================================================
+
+  void _atualizarDatasDeNocalendario(int frequencia) {
+    final chaves = tarefas.keys.toList();
+    for (final chave in chaves) {
+      tarefas[chave]
+          ?.removeWhere((t) => t.nome == "Troca de água (automática)");
+      if (tarefas[chave]?.isEmpty ?? false) {
+        tarefas.remove(chave);
+      }
+    }
+
+    final hoje = DateTime.now();
+    for (int i = 1; i <= (90 ~/ frequencia); i++) {
+      final dataTraca = hoje.add(Duration(days: frequencia * i));
+      final chave =
+          DateTime.utc(dataTraca.year, dataTraca.month, dataTraca.day);
+      tarefas.putIfAbsent(chave, () => []);
+      if (!tarefas[chave]!
+          .any((t) => t.nome == "Troca de água (automática)")) {
+        tarefas[chave]!
+            .insert(0, TarefaCalendario(nome: "Troca de água (automática)"));
+      }
+    }
+  }
+
+  // ======================================================
+  // ALERTAS
+  // ======================================================
+
+  List<ItemAlerta> get _alertasCalendario {
+    final hoje = DateTime.now();
+    final List<ItemAlerta> gerados = [];
+
+    for (int d = 0; d <= 14; d++) {
+      final dia = hoje.add(Duration(days: d));
+      final chave = DateTime.utc(dia.year, dia.month, dia.day);
+      final lista = tarefas[chave];
+      if (lista == null || lista.isEmpty) continue;
+
+      for (final tarefa in lista) {
+        if (tarefa.concluida) continue;
+
+        final TipoAlerta tipo;
+        final String tempo;
+        if (d == 0) {
+          tipo = TipoAlerta.critico;
+          tempo = "hoje";
+        } else if (d == 1) {
+          tipo = TipoAlerta.aviso;
+          tempo = "amanhã";
+        } else if (d <= 3) {
+          tipo = TipoAlerta.aviso;
+          tempo = "em $d dias";
+        } else {
+          tipo = TipoAlerta.info;
+          tempo = "em $d dias";
+        }
+
+        gerados.add(ItemAlerta(
+          titulo: tarefa.nome,
+          descricao: "Agendado para ${_formatarData(dia)}",
+          tempo: tempo,
+          tipo: tipo,
+        ));
+      }
+    }
+
+    if (_estadoVoltagem == _EstadoVoltagem.critico) {
+      gerados.insert(
+        0,
+        ItemAlerta(
+          titulo: "Tensão crítica detectada",
+          descricao:
+              "Voltagem em ${voltagemInstantanea.toStringAsFixed(1)} V. Verifique a fonte de alimentação.",
+          tempo: "agora",
+          tipo: TipoAlerta.critico,
+        ),
+      );
+    }
+
+    if (!esp32Conectado) {
+      gerados.insert(
+        0,
+        ItemAlerta(
+          titulo: "ESP32 desconectado",
+          descricao: "Nenhuma mensagem recebida do dispositivo.",
+          tempo: "agora",
+          tipo: TipoAlerta.critico,
+        ),
+      );
+    }
+
+    return gerados;
+  }
+
+  // ======================================================
+  // HELPERS DE VOLTAGEM
+  // ======================================================
+
+  _EstadoVoltagem get _estadoVoltagem {
+    if (!esp32Conectado) return _EstadoVoltagem.desconectado;
+    if (voltagemInstantanea > 10) return _EstadoVoltagem.tomada;
+    if (voltagemInstantanea < 2) return _EstadoVoltagem.bateria;
+    return _EstadoVoltagem.critico;
+  }
+
+  Color get _corVoltagem {
+    switch (_estadoVoltagem) {
+      case _EstadoVoltagem.tomada:
+        return Colors.greenAccent;
+      case _EstadoVoltagem.bateria:
+        return const Color(0xFF00D1FF);
+      case _EstadoVoltagem.critico:
+        return Colors.deepOrangeAccent;
+      case _EstadoVoltagem.desconectado:
+        return Colors.redAccent;
+    }
+  }
+
+  IconData get _iconeVoltagem {
+    switch (_estadoVoltagem) {
+      case _EstadoVoltagem.tomada:
+        return LucideIcons.plug;
+      case _EstadoVoltagem.bateria:
+        return LucideIcons.battery;
+      case _EstadoVoltagem.critico:
+        return LucideIcons.triangleAlert;
+      case _EstadoVoltagem.desconectado:
+        return LucideIcons.plugZap;
+    }
+  }
+
+  String get _rotuloVoltagem {
+    switch (_estadoVoltagem) {
+      case _EstadoVoltagem.tomada:
+        return "Ligado na tomada";
+      case _EstadoVoltagem.bateria:
+        return "Ligado na bateria";
+      case _EstadoVoltagem.critico:
+        return "Tensão crítica!";
+      case _EstadoVoltagem.desconectado:
+        return "Desconectado da fonte de alimentação";
+    }
+  }
+
+  // ======================================================
+  // HELPERS DE pH
+  // ======================================================
+
+  Color get _corPh {
+    if (phInstantaneo == 0) return const Color(0xFF00D1FF);
+    if (phInstantaneo < 6.5) return Colors.orangeAccent;
+    if (phInstantaneo > 7.5) return Colors.purpleAccent;
+    return Colors.greenAccent;
+  }
+
+  String get _rotuloPh {
+    if (phInstantaneo == 0) return "Aguardando leitura";
+    if (phInstantaneo < 6.5) return "pH ácido — fora do ideal";
+    if (phInstantaneo > 7.5) return "pH alcalino — fora do ideal";
+    return "pH neutro — ideal";
+  }
+
+  IconData get _iconePh {
+    if (phInstantaneo < 6.5 && phInstantaneo != 0)
+      return LucideIcons.triangleAlert;
+    if (phInstantaneo > 7.5) return LucideIcons.triangleAlert;
+    return LucideIcons.flaskConical;
+  }
+
+  bool get _phForaDoIdeal =>
+      phInstantaneo != 0 && (phInstantaneo < 6.5 || phInstantaneo > 7.5);
+
+  bool _todasConcluidas(DateTime dia) {
+    final chave = DateTime.utc(dia.year, dia.month, dia.day);
+    final lista = tarefas[chave];
+    if (lista == null || lista.isEmpty) return false;
+    return lista.every((t) => t.concluida);
+  }
+
+  bool _apenasAutomaticas(DateTime dia) {
+    final chave = DateTime.utc(dia.year, dia.month, dia.day);
+    final lista = tarefas[chave];
+    if (lista == null || lista.isEmpty) return false;
+    return lista.every((t) => t.nome == "Troca de água (automática)");
+  }
+
+  // ======================================================
+  // HELPERS DE FORMATAÇÃO
+  // ======================================================
+
+  String _formatarDataHora(DateTime dt) {
+    final d = dt.day.toString().padLeft(2, '0');
+    final m = dt.month.toString().padLeft(2, '0');
+    final h = dt.hour.toString().padLeft(2, '0');
+    final min = dt.minute.toString().padLeft(2, '0');
+    return "$d/$m ${h}h${min}";
+  }
+
+  String _formatarData(DateTime data) {
+    const meses = [
+      'jan', 'fev', 'mar', 'abr', 'mai', 'jun',
+      'jul', 'ago', 'set', 'out', 'nov', 'dez'
+    ];
+    const diasSemana = [
+      'seg', 'ter', 'qua', 'qui', 'sex', 'sáb', 'dom'
+    ];
+    final semana = diasSemana[data.weekday - 1];
+    final mes = meses[data.month - 1];
+    return "${semana.substring(0, 1).toUpperCase()}${semana.substring(1)}, "
+        "${data.day} de "
+        "${mes.substring(0, 1).toUpperCase()}${mes.substring(1)}";
+  }
+
+  // ======================================================
+  // BUILD
+  // ======================================================
+
+  @override
+  Widget build(BuildContext context) {
+    final isLargo = MediaQuery.of(context).size.width > 900;
+
+    return Scaffold(
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(18),
+          child: isLargo ? _layoutLargo() : _layoutEstrito(),
+        ),
+      ),
+    );
+  }
+
+  // ======================================================
+  // LAYOUTS
+  // ======================================================
+
+  Widget _layoutLargo() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _cabecalho(),
+        const SizedBox(height: 24),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              flex: 3,
+              child: Column(
+                children: [
+                  _cartaoProximaTroca(),
+                  const SizedBox(height: 18),
+                  _visorInstantaneoTemp(),
+                  const SizedBox(height: 18),
+                  _visorInstantaneoVolt(),
+                  const SizedBox(height: 18),
+                  _visorInstantaneoPh(),
+                  const SizedBox(height: 18),
+                  _cartoesSensor(),
+                  const SizedBox(height: 18),
+                  _cartaoHistoricoPh(),
+                  const SizedBox(height: 18),
+                  _cartaoHistoricoSemanal(),
+                  const SizedBox(height: 18),
+                  _cartaoHistoricoSemanalPh(), // NOVO
+                  const SizedBox(height: 18),
+                  _cartaoCalendario(),
+                ],
+              ),
+            ),
+            const SizedBox(width: 18),
+            SizedBox(
+              width: 320,
+              child: Column(
+                children: [
+                  _cartaoAlertas(),
+                  const SizedBox(height: 18),
+                  _cartaoControles(),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _layoutEstrito() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _cabecalho(),
+        const SizedBox(height: 24),
+        _cartaoProximaTroca(),
+        const SizedBox(height: 18),
+        _visorInstantaneoTemp(),
+        const SizedBox(height: 18),
+        _visorInstantaneoVolt(),
+        const SizedBox(height: 18),
+        _visorInstantaneoPh(),
+        const SizedBox(height: 18),
+        _cartoesSensor(),
+        const SizedBox(height: 18),
+        _cartaoHistoricoPh(),
+        const SizedBox(height: 18),
+        _cartaoHistoricoSemanal(),
+        const SizedBox(height: 18),
+        _cartaoHistoricoSemanalPh(), // NOVO
+        const SizedBox(height: 18),
+        _cartaoAlertas(),
+        const SizedBox(height: 18),
+        _cartaoControles(),
+        const SizedBox(height: 18),
+        _cartaoCalendario(),
+      ],
+    );
+  }
+
+  // ======================================================
+  // CABEÇALHO
+  // ======================================================
+
+  Widget _cabecalho() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Row(
+          children: [
+            Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: const Color(0xFF00D1FF),
+                borderRadius: BorderRadius.circular(18),
+              ),
+              child: const Icon(Icons.water, color: Colors.black),
+            ),
+            const SizedBox(width: 14),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  "Glub",
+                  style: GoogleFonts.inter(
+                      fontSize: 28, fontWeight: FontWeight.bold),
+                ),
+                Text(
+                  "Aquário inteligente",
+                  style: TextStyle(color: Colors.white.withOpacity(.6)),
+                ),
+              ],
+            ),
+          ],
+        ),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.green.withOpacity(.12),
+                borderRadius: BorderRadius.circular(30),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircleAvatar(
+                      radius: 4, backgroundColor: Colors.greenAccent),
+                  SizedBox(width: 8),
+                  Text("Broker online", style: TextStyle(fontSize: 13)),
+                ],
+              ),
+            ),
+            const SizedBox(height: 6),
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: esp32Conectado
+                    ? Colors.green.withOpacity(.12)
+                    : Colors.red.withOpacity(.12),
+                borderRadius: BorderRadius.circular(30),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircleAvatar(
+                    radius: 4,
+                    backgroundColor: esp32Conectado
+                        ? Colors.greenAccent
+                        : Colors.redAccent,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    esp32Conectado ? "ESP32 online" : "ESP32 offline",
+                    style: TextStyle(
+                      fontSize: 13,
+                      color: esp32Conectado
+                          ? Colors.white
+                          : Colors.redAccent,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  // ======================================================
+  // CARTÃO PRÓXIMA TROCA
+  // ======================================================
+
+  Widget _cartaoProximaTroca() {
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(LucideIcons.droplets,
+                  color: Color(0xFF00D1FF), size: 18),
+              const SizedBox(width: 8),
+              Text(
+                "PRÓXIMA TROCA DE ÁGUA",
+                style: GoogleFonts.inter(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: const Color(0xFF00D1FF),
+                  letterSpacing: 1.2,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                "$diasParaTroca",
+                style: GoogleFonts.inter(
+                  fontSize: 56,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                  height: 1,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Text(
+                  "dias",
+                  style: GoogleFonts.inter(
+                      fontSize: 18, color: Colors.white70),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            "Agendado para ${_formatarData(proximaTroca)}",
+            style: TextStyle(
+                color: Colors.white.withOpacity(.5), fontSize: 13),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // VISOR INSTANTÂNEO — TEMPERATURA
+  // ======================================================
+
+  Widget _visorInstantaneoTemp() {
+    final agora = ultimaAtualizacaoTemp;
+    final horario = agora != null
+        ? '${agora.hour.toString().padLeft(2, '0')}:'
+            '${agora.minute.toString().padLeft(2, '0')}:'
+            '${agora.second.toString().padLeft(2, '0')}'
+        : '-- : -- : --';
+
+    final corTemp = _corTemperatura(temperaturaInstantanea);
+
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration().copyWith(
+        border: Border.all(
+          color: const Color(0xFF00D1FF).withOpacity(.25),
+          width: 1.5,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF00D1FF).withOpacity(.15),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(LucideIcons.zap,
+                        color: Color(0xFF00D1FF), size: 16),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    "LEITURA INSTANTÂNEA — ESP32 via MQTT",
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: const Color(0xFF00D1FF),
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                ],
+              ),
+              Row(
+                children: [
+                  _pulsoDot(Colors.greenAccent),
+                  const SizedBox(width: 6),
+                  Text(
+                    "AO VIVO",
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.greenAccent,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          _visorTempInstantaneo(corTemp),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              const Icon(LucideIcons.clock3, size: 13, color: Colors.white38),
+              const SizedBox(width: 5),
+              Text(
+                "Última atualização: $horario",
+                style: const TextStyle(color: Colors.white38, fontSize: 12),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _visorTempInstantaneo(Color corTemp) {
+    final bool abaixoDoIdeal = temperaturaInstantanea != 0 &&
+        temperaturaInstantanea < _tempMin;
+    final bool acimaDoIdeal = temperaturaInstantanea > _tempMax;
+    final bool foraDoIdeal = abaixoDoIdeal || acimaDoIdeal;
+
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: corTemp.withOpacity(.06),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: corTemp.withOpacity(.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(LucideIcons.thermometer, color: corTemp, size: 16),
+              const SizedBox(width: 6),
+              const Text(
+                "Temperatura",
+                style: TextStyle(color: Colors.white60, fontSize: 13),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                temperaturaInstantanea.toStringAsFixed(1),
+                style: GoogleFonts.inter(
+                  fontSize: 52,
+                  fontWeight: FontWeight.bold,
+                  color: corTemp,
+                  height: 1,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6, left: 4),
+                child: Text(
+                  "°C",
+                  style: GoogleFonts.inter(
+                      fontSize: 22, color: corTemp.withOpacity(.7)),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            _subtituloTempIdeal,
+            style:
+                const TextStyle(color: Colors.white38, fontSize: 12),
+          ),
+          if (foraDoIdeal) ...[
+            const SizedBox(height: 12),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: abaixoDoIdeal
+                    ? Colors.blueAccent.withOpacity(.15)
+                    : Colors.deepOrangeAccent.withOpacity(.15),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: abaixoDoIdeal
+                      ? Colors.blueAccent.withOpacity(.4)
+                      : Colors.deepOrangeAccent.withOpacity(.4),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    abaixoDoIdeal
+                        ? LucideIcons.thermometerSnowflake
+                        : LucideIcons.thermometerSun,
+                    size: 15,
+                    color: abaixoDoIdeal
+                        ? Colors.blueAccent
+                        : Colors.deepOrangeAccent,
+                  ),
+                  const SizedBox(width: 7),
+                  Text(
+                    abaixoDoIdeal
+                        ? "Temperatura abaixo do ideal"
+                        : "Temperatura acima do ideal",
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: abaixoDoIdeal
+                          ? Colors.blueAccent
+                          : Colors.deepOrangeAccent,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // VISOR INSTANTÂNEO — VOLTAGEM
+  // ======================================================
+
+  Widget _visorInstantaneoVolt() {
+    final agora = ultimaAtualizacaoVolt;
+    final horario = agora != null
+        ? '${agora.hour.toString().padLeft(2, '0')}:'
+            '${agora.minute.toString().padLeft(2, '0')}:'
+            '${agora.second.toString().padLeft(2, '0')}'
+        : '-- : -- : --';
+
+    final cor = _corVoltagem;
+    final estado = _estadoVoltagem;
+
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration().copyWith(
+        border: Border.all(color: cor.withOpacity(.25), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: cor.withOpacity(.15),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Icon(LucideIcons.zap, color: cor, size: 16),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    "VOLTAGEM INSTANTÂNEA — ESP32 via MQTT",
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: cor,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                ],
+              ),
+              Row(
+                children: [
+                  _pulsoDot(cor),
+                  const SizedBox(width: 6),
+                  Text(
+                    esp32Conectado ? "AO VIVO" : "OFFLINE",
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: cor,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          _visorVoltInstantanea(cor, estado),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              const Icon(LucideIcons.clock3, size: 13, color: Colors.white38),
+              const SizedBox(width: 5),
+              Text(
+                esp32Conectado
+                    ? "Última atualização: $horario"
+                    : "Última leitura: $horario",
+                style: const TextStyle(color: Colors.white38, fontSize: 12),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _visorVoltInstantanea(Color cor, _EstadoVoltagem estado) {
+    final bool isCritico = estado == _EstadoVoltagem.critico;
+    final bool isDesconectado = estado == _EstadoVoltagem.desconectado;
+
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: cor.withOpacity(.06),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: cor.withOpacity(.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(LucideIcons.zap, color: cor, size: 16),
+              const SizedBox(width: 6),
+              const Text(
+                "Voltagem",
+                style: TextStyle(color: Colors.white60, fontSize: 13),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                isDesconectado
+                    ? "--.-"
+                    : voltagemInstantanea.toStringAsFixed(1),
+                style: GoogleFonts.inter(
+                  fontSize: 52,
+                  fontWeight: FontWeight.bold,
+                  color: cor,
+                  height: 1,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6, left: 4),
+                child: Text(
+                  "V",
+                  style: GoogleFonts.inter(
+                      fontSize: 22, color: cor.withOpacity(.7)),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Container(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+            decoration: BoxDecoration(
+              color: cor.withOpacity(.15),
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: cor.withOpacity(.4)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(_iconeVoltagem, size: 15, color: cor),
+                const SizedBox(width: 7),
+                Flexible(
+                  child: Text(
+                    _rotuloVoltagem,
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: cor,
+                    ),
+                  ),
+                ),
+                if (isCritico) ...[
+                  const SizedBox(width: 10),
+                  Text(
+                    "Verifique a fonte de alimentação",
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      color: cor.withOpacity(.7),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // VISOR INSTANTÂNEO — pH
+  // ======================================================
+
+  Widget _visorInstantaneoPh() {
+    final agora = ultimaAtualizacaoPh;
+    final horario = agora != null
+        ? '${agora.hour.toString().padLeft(2, '0')}:'
+            '${agora.minute.toString().padLeft(2, '0')}:'
+            '${agora.second.toString().padLeft(2, '0')}'
+        : '-- : -- : --';
+
+    final cor = _corPh;
+
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration().copyWith(
+        border: Border.all(color: cor.withOpacity(.25), width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(6),
+                    decoration: BoxDecoration(
+                      color: cor.withOpacity(.15),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child:
+                        Icon(LucideIcons.flaskConical, color: cor, size: 16),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    "pH INSTANTÂNEO — ESP32 via MQTT",
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: cor,
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                ],
+              ),
+              Row(
+                children: [
+                  _pulsoDot(cor),
+                  const SizedBox(width: 6),
+                  Text(
+                    "AO VIVO",
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: cor,
+                      letterSpacing: 1,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          _visorPhInstantaneo(cor),
+          const SizedBox(height: 16),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              const Icon(LucideIcons.clock3, size: 13, color: Colors.white38),
+              const SizedBox(width: 5),
+              Text(
+                "Última atualização: $horario",
+                style: const TextStyle(color: Colors.white38, fontSize: 12),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _visorPhInstantaneo(Color cor) {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: cor.withOpacity(.06),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: cor.withOpacity(.25)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(LucideIcons.flaskConical, color: cor, size: 16),
+              const SizedBox(width: 6),
+              const Text(
+                "pH da Água",
+                style: TextStyle(color: Colors.white60, fontSize: 13),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                phInstantaneo == 0
+                    ? "--.-"
+                    : phInstantaneo.toStringAsFixed(2),
+                style: GoogleFonts.inter(
+                  fontSize: 52,
+                  fontWeight: FontWeight.bold,
+                  color: cor,
+                  height: 1,
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6, left: 4),
+                child: Text(
+                  "pH",
+                  style: GoogleFonts.inter(
+                      fontSize: 22, color: cor.withOpacity(.7)),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            "Ideal: 6.5 – 7.5",
+            style: TextStyle(color: Colors.white38, fontSize: 12),
+          ),
+          if (_phForaDoIdeal) ...[
+            const SizedBox(height: 12),
+            Container(
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                color: cor.withOpacity(.15),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: cor.withOpacity(.4)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(_iconePh, size: 15, color: cor),
+                  const SizedBox(width: 7),
+                  Text(
+                    _rotuloPh,
+                    style: GoogleFonts.inter(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: cor,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _pulsoDot(Color cor) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0.4, end: 1.0),
+      duration: const Duration(milliseconds: 800),
+      curve: Curves.easeInOut,
+      builder: (_, v, __) => Opacity(
+        opacity: v,
+        child: CircleAvatar(radius: 4, backgroundColor: cor),
+      ),
+    );
+  }
+
+  // ======================================================
+  // CARTÃO SENSOR — TEMPERATURA INTRADAY
+  // ======================================================
+
+  Widget _cartoesSensor() {
+    return CartaoSensor(
+      titulo: "Temperatura da Água",
+      valor: temperaturaAtual.toStringAsFixed(1),
+      unidade: "°C",
+      subtitulo: _subtituloTempIdeal,
+      icone: LucideIcons.thermometer,
+      historicoTemp: _historicoTemp,
+    );
+  }
+
+  // ======================================================
+  // GRÁFICO HISTÓRICO pH — INTRADAY
+  // CORRIGIDO: padding nas bordas do gráfico
+  // ======================================================
+
+  Widget _cartaoHistoricoPh() {
+    const corPh = Color(0xFF00FFB3);
+
+    // CORRIGIDO: calcular min/max com padding
+    double minY = 5.5;
+    double maxY = 9.0;
+    if (_historicoPh.isNotEmpty) {
+      final valores = _historicoPh.map((e) => e.valor).toList();
+      final minV = valores.reduce((a, b) => a < b ? a : b);
+      final maxV = valores.reduce((a, b) => a > b ? a : b);
+      minY = (minV - 0.3).clamp(0.0, 14.0);
+      maxY = (maxV + 0.3).clamp(0.0, 14.0);
+      if ((maxY - minY) < 0.5) {
+        minY -= 0.25;
+        maxY += 0.25;
+      }
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(LucideIcons.flaskConical,
+                  color: Color(0xFF00FFB3)),
+              const SizedBox(width: 10),
+              Text(
+                "pH da Água",
+                style: GoogleFonts.inter(
+                    fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            "Leituras das últimas horas (intervalo: 20 min)",
+            style: TextStyle(
+                color: Colors.white.withOpacity(.5), fontSize: 13),
+          ),
+          const SizedBox(height: 24),
+          SizedBox(
+            height: 200,
+            child: _historicoPh.isEmpty
+                ? Center(
+                    child: Text(
+                      "Aguardando dados do sensor...",
+                      style: TextStyle(
+                          color: Colors.white.withOpacity(.4)),
+                    ),
+                  )
+                : LineChart(
+                    LineChartData(
+                      gridData: const FlGridData(show: false),
+                      titlesData: FlTitlesData(
+                        leftTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        topTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        rightTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        bottomTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 22,
+                            interval: 1,
+                            getTitlesWidget: (value, meta) {
+                              int idx = value.toInt();
+                              if (idx >= 0 &&
+                                  idx < _historicoPh.length) {
+                                bool mostrar = false;
+                                if (_historicoPh.length <= 4) {
+                                  mostrar = true;
+                                } else {
+                                  int meio =
+                                      (_historicoPh.length / 2).floor();
+                                  if (idx == 0 ||
+                                      idx == meio ||
+                                      idx == _historicoPh.length - 1) {
+                                    mostrar = true;
+                                  }
+                                }
+                                if (mostrar) {
+                                  final DateTime horario =
+                                      _historicoPh[idx].horario;
+                                  return Padding(
+                                    padding:
+                                        const EdgeInsets.only(top: 6),
+                                    child: Text(
+                                      '${horario.hour.toString().padLeft(2, '0')}:${horario.minute.toString().padLeft(2, '0')}',
+                                      style: const TextStyle(
+                                        color: Colors.white38,
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                  );
+                                }
+                              }
+                              return const SizedBox();
+                            },
+                          ),
+                        ),
+                      ),
+                      borderData: FlBorderData(show: false),
+                      minX: 0,
+                      maxX: (_historicoPh.length - 1).toDouble(),
+                      minY: minY,
+                      maxY: maxY,
+                      lineBarsData: [
+                        LineChartBarData(
+                          spots: _historicoPh
+                              .asMap()
+                              .entries
+                              .map((e) => FlSpot(
+                                  e.key.toDouble(), e.value.valor))
+                              .toList(),
+                          isCurved: true,
+                          color: corPh,
+                          barWidth: 3,
+                          isStrokeCapRound: true,
+                          dotData: const FlDotData(show: true),
+                          belowBarData: BarAreaData(
+                            show: true,
+                            color: corPh.withOpacity(0.1),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // HISTÓRICO SEMANAL — TEMPERATURA
+  // CORRIGIDO: padding nas bordas do gráfico
+  // ======================================================
+
+  Widget _cartaoHistoricoSemanal() {
+    const corManha = Color(0xFF00D1FF);
+    const corTarde = Color(0xFF00FFB3);
+    const corNoite = Color(0xFF7B61FF);
+    const diasSemana = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+
+    List<FlSpot> spotsManha = [];
+    List<FlSpot> spotsTarde = [];
+    List<FlSpot> spotsNoite = [];
+
+    for (int i = 0; i < _historicoSemanal.length; i++) {
+      final l = _historicoSemanal[i];
+      if (l.mediaManha > 0) spotsManha.add(FlSpot(i.toDouble(), l.mediaManha));
+      if (l.mediaTarde > 0) spotsTarde.add(FlSpot(i.toDouble(), l.mediaTarde));
+      if (l.mediaNoite > 0) spotsNoite.add(FlSpot(i.toDouble(), l.mediaNoite));
+    }
+
+    final todosValores = [
+      ...spotsManha.map((s) => s.y),
+      ...spotsTarde.map((s) => s.y),
+      ...spotsNoite.map((s) => s.y),
+    ];
+
+    // CORRIGIDO: padding explícito de 0.5°C em cima e embaixo
+    double minY = 23.0;
+    double maxY = 29.0;
+    if (todosValores.isNotEmpty) {
+      final minV = todosValores.reduce((a, b) => a < b ? a : b);
+      final maxV = todosValores.reduce((a, b) => a > b ? a : b);
+      minY = (minV - 0.5);
+      maxY = (maxV + 0.5);
+      if ((maxY - minY) < 1.0) {
+        minY -= 0.5;
+        maxY += 0.5;
+      }
+      // Arredonda para múltiplos de 0.5 para labels bonitas
+      minY = (minY * 2).floor() / 2;
+      maxY = (maxY * 2).ceil() / 2;
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(LucideIcons.calendarDays,
+                  color: Color(0xFF00D1FF)),
+              const SizedBox(width: 10),
+              Text(
+                "Histórico Semanal de Temperatura",
+                style: GoogleFonts.inter(
+                    fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          SizedBox(
+            height: 220,
+            child: _historicoSemanal.isEmpty
+                ? Center(
+                    child: Text(
+                      "Aguardando dados do sensor...",
+                      style: TextStyle(
+                          color: Colors.white.withOpacity(.4)),
+                    ),
+                  )
+                : LineChart(
+                    LineChartData(
+                      gridData: FlGridData(
+                        show: true,
+                        drawVerticalLine: false,
+                        getDrawingHorizontalLine: (v) => FlLine(
+                          color: Colors.white.withOpacity(.07),
+                          strokeWidth: 1,
+                        ),
+                      ),
+                      titlesData: FlTitlesData(
+                        leftTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 42,
+                            interval: 0.5,
+                            getTitlesWidget: (value, meta) {
+                              final rounded =
+                                  (value * 2).round() / 2;
+                              if ((rounded - value).abs() > 0.01) {
+                                return const SizedBox();
+                              }
+                              return Text(
+                                rounded.toStringAsFixed(1),
+                                style: const TextStyle(
+                                    color: Colors.white38, fontSize: 10),
+                              );
+                            },
+                          ),
+                        ),
+                        topTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        rightTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        bottomTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 22,
+                            interval: 1,
+                            getTitlesWidget: (value, meta) {
+                              final idx = value.toInt();
+                              if (idx >= 0 &&
+                                  idx < _historicoSemanal.length) {
+                                final dia = _historicoSemanal[idx].dia;
+                                return Padding(
+                                  padding:
+                                      const EdgeInsets.only(top: 6),
+                                  child: Text(
+                                    diasSemana[dia.weekday % 7],
+                                    style: const TextStyle(
+                                      color: Colors.white38,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                );
+                              }
+                              return const SizedBox();
+                            },
+                          ),
+                        ),
+                      ),
+                      borderData: FlBorderData(show: false),
+                      minX: 0,
+                      maxX: (_historicoSemanal.length - 1).toDouble(),
+                      minY: minY,
+                      maxY: maxY,
+                      lineBarsData: [
+                        if (spotsManha.isNotEmpty)
+                          LineChartBarData(
+                            spots: spotsManha,
+                            isCurved: true,
+                            color: corManha,
+                            barWidth: 2.5,
+                            isStrokeCapRound: true,
+                            dotData: const FlDotData(show: true),
+                            belowBarData: BarAreaData(
+                              show: true,
+                              color: corManha.withOpacity(.07),
+                            ),
+                          ),
+                        if (spotsTarde.isNotEmpty)
+                          LineChartBarData(
+                            spots: spotsTarde,
+                            isCurved: true,
+                            color: corTarde,
+                            barWidth: 2.5,
+                            isStrokeCapRound: true,
+                            dotData: const FlDotData(show: true),
+                            belowBarData: BarAreaData(
+                              show: true,
+                              color: corTarde.withOpacity(.07),
+                            ),
+                          ),
+                        if (spotsNoite.isNotEmpty)
+                          LineChartBarData(
+                            spots: spotsNoite,
+                            isCurved: true,
+                            color: corNoite,
+                            barWidth: 2.5,
+                            isStrokeCapRound: true,
+                            dotData: const FlDotData(show: true),
+                            belowBarData: BarAreaData(
+                              show: true,
+                              color: corNoite.withOpacity(.07),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              _pontoLegenda(corManha, "Manhã (00h–8h)"),
+              const SizedBox(width: 18),
+              _pontoLegenda(corTarde, "Tarde (8h–16h)"),
+              const SizedBox(width: 18),
+              _pontoLegenda(corNoite, "Noite (16h–24h)"),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // NOVO: HISTÓRICO SEMANAL DE pH
+  // ======================================================
+
+  Widget _cartaoHistoricoSemanalPh() {
+    const corManha = Color(0xFF00FFB3);
+    const corTarde = Color(0xFFFFB347);
+    const corNoite = Color(0xFFBB86FC);
+    const diasSemana = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+
+    List<FlSpot> spotsManha = [];
+    List<FlSpot> spotsTarde = [];
+    List<FlSpot> spotsNoite = [];
+
+    for (int i = 0; i < _historicoSemanalPh.length; i++) {
+      final l = _historicoSemanalPh[i];
+      if (l.mediaManha > 0) spotsManha.add(FlSpot(i.toDouble(), l.mediaManha));
+      if (l.mediaTarde > 0) spotsTarde.add(FlSpot(i.toDouble(), l.mediaTarde));
+      if (l.mediaNoite > 0) spotsNoite.add(FlSpot(i.toDouble(), l.mediaNoite));
+    }
+
+    final todosValores = [
+      ...spotsManha.map((s) => s.y),
+      ...spotsTarde.map((s) => s.y),
+      ...spotsNoite.map((s) => s.y),
+    ];
+
+    // Padding de 0.3 pH acima e abaixo
+    double minY = 5.5;
+    double maxY = 9.0;
+    if (todosValores.isNotEmpty) {
+      final minV = todosValores.reduce((a, b) => a < b ? a : b);
+      final maxV = todosValores.reduce((a, b) => a > b ? a : b);
+      minY = (minV - 0.3).clamp(0.0, 14.0);
+      maxY = (maxV + 0.3).clamp(0.0, 14.0);
+      if ((maxY - minY) < 0.5) {
+        minY -= 0.25;
+        maxY += 0.25;
+      }
+      // Arredonda para múltiplos de 0.25 para labels bonitas
+      minY = (minY * 4).floor() / 4;
+      maxY = (maxY * 4).ceil() / 4;
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(LucideIcons.calendarDays,
+                  color: Color(0xFF00FFB3)),
+              const SizedBox(width: 10),
+              Text(
+                "Histórico Semanal de pH",
+                style: GoogleFonts.inter(
+                    fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 24),
+          SizedBox(
+            height: 220,
+            child: _historicoSemanalPh.isEmpty
+                ? Center(
+                    child: Text(
+                      "Aguardando dados do sensor...",
+                      style: TextStyle(
+                          color: Colors.white.withOpacity(.4)),
+                    ),
+                  )
+                : LineChart(
+                    LineChartData(
+                      gridData: FlGridData(
+                        show: true,
+                        drawVerticalLine: false,
+                        getDrawingHorizontalLine: (v) => FlLine(
+                          color: Colors.white.withOpacity(.07),
+                          strokeWidth: 1,
+                        ),
+                      ),
+                      titlesData: FlTitlesData(
+                        leftTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 42,
+                            interval: 0.25,
+                            getTitlesWidget: (value, meta) {
+                              final rounded = (value * 4).round() / 4;
+                              if ((rounded - value).abs() > 0.01) {
+                                return const SizedBox();
+                              }
+                              return Text(
+                                rounded.toStringAsFixed(2),
+                                style: const TextStyle(
+                                    color: Colors.white38, fontSize: 10),
+                              );
+                            },
+                          ),
+                        ),
+                        topTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        rightTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        bottomTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 22,
+                            interval: 1,
+                            getTitlesWidget: (value, meta) {
+                              final idx = value.toInt();
+                              if (idx >= 0 &&
+                                  idx < _historicoSemanalPh.length) {
+                                final dia = _historicoSemanalPh[idx].dia;
+                                return Padding(
+                                  padding:
+                                      const EdgeInsets.only(top: 6),
+                                  child: Text(
+                                    diasSemana[dia.weekday % 7],
+                                    style: const TextStyle(
+                                      color: Colors.white38,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                );
+                              }
+                              return const SizedBox();
+                            },
+                          ),
+                        ),
+                      ),
+                      borderData: FlBorderData(show: false),
+                      minX: 0,
+                      maxX: (_historicoSemanalPh.length - 1).toDouble(),
+                      minY: minY,
+                      maxY: maxY,
+                      lineBarsData: [
+                        if (spotsManha.isNotEmpty)
+                          LineChartBarData(
+                            spots: spotsManha,
+                            isCurved: true,
+                            color: corManha,
+                            barWidth: 2.5,
+                            isStrokeCapRound: true,
+                            dotData: const FlDotData(show: true),
+                            belowBarData: BarAreaData(
+                              show: true,
+                              color: corManha.withOpacity(.07),
+                            ),
+                          ),
+                        if (spotsTarde.isNotEmpty)
+                          LineChartBarData(
+                            spots: spotsTarde,
+                            isCurved: true,
+                            color: corTarde,
+                            barWidth: 2.5,
+                            isStrokeCapRound: true,
+                            dotData: const FlDotData(show: true),
+                            belowBarData: BarAreaData(
+                              show: true,
+                              color: corTarde.withOpacity(.07),
+                            ),
+                          ),
+                        if (spotsNoite.isNotEmpty)
+                          LineChartBarData(
+                            spots: spotsNoite,
+                            isCurved: true,
+                            color: corNoite,
+                            barWidth: 2.5,
+                            isStrokeCapRound: true,
+                            dotData: const FlDotData(show: true),
+                            belowBarData: BarAreaData(
+                              show: true,
+                              color: corNoite.withOpacity(.07),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              _pontoLegenda(corManha, "Manhã (00h–8h)"),
+              const SizedBox(width: 18),
+              _pontoLegenda(corTarde, "Tarde (8h–16h)"),
+              const SizedBox(width: 18),
+              _pontoLegenda(corNoite, "Noite (16h–24h)"),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // ALERTAS
+  // ======================================================
+
+  Widget _cartaoAlertas() {
+    final todosAlertas = _alertasCalendario;
+    final qtdCriticos =
+        todosAlertas.where((a) => a.tipo == TipoAlerta.critico).length;
+
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  const Icon(LucideIcons.bell, color: Color(0xFF00D1FF)),
+                  const SizedBox(width: 10),
+                  Text(
+                    "Alertas",
+                    style: GoogleFonts.inter(
+                        fontSize: 20, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
+              if (qtdCriticos > 0)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.red,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    "$qtdCriticos crítico(s)",
+                    style: const TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.bold),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            "Próximas tarefas e avisos do sistema",
+            style: TextStyle(
+                color: Colors.white.withOpacity(.5), fontSize: 13),
+          ),
+          const SizedBox(height: 16),
+          if (todosAlertas.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                "Nenhuma tarefa nos próximos 14 dias.",
+                style: TextStyle(
+                    color: Colors.white.withOpacity(.4), fontSize: 14),
+              ),
+            ),
+          ...todosAlertas.map((a) => _tileAlerta(a)),
+        ],
+      ),
+    );
+  }
+
+  Widget _tileAlerta(ItemAlerta alerta) {
+    final icone = alerta.tipo == TipoAlerta.critico
+        ? LucideIcons.triangleAlert
+        : alerta.tipo == TipoAlerta.aviso
+            ? LucideIcons.bell
+            : LucideIcons.info;
+
+    final corIcone = alerta.tipo == TipoAlerta.critico
+        ? Colors.redAccent
+        : alerta.tipo == TipoAlerta.aviso
+            ? Colors.orangeAccent
+            : const Color(0xFF00D1FF);
+
+    final corFundo = alerta.tipo == TipoAlerta.critico
+        ? Colors.red.withOpacity(.08)
+        : Colors.white.withOpacity(.04);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: corFundo,
+        borderRadius: BorderRadius.circular(16),
+        border: alerta.tipo == TipoAlerta.critico
+            ? Border.all(color: Colors.red.withOpacity(.3))
+            : null,
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          CircleAvatar(
+            radius: 18,
+            backgroundColor: corIcone.withOpacity(.15),
+            child: Icon(icone, color: corIcone, size: 18),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        alerta.titulo,
+                        style: GoogleFonts.inter(
+                            fontWeight: FontWeight.w600, fontSize: 14),
+                      ),
+                    ),
+                    Text(
+                      alerta.tempo,
+                      style: TextStyle(
+                          color: Colors.white.withOpacity(.4),
+                          fontSize: 12),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  alerta.descricao,
+                  style: TextStyle(
+                      color: Colors.white.withOpacity(.6), fontSize: 13),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // CONTROLES
+  // ======================================================
+
+  Widget _cartaoControles() {
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(LucideIcons.sliders, color: Color(0xFF00D1FF)),
+              const SizedBox(width: 10),
+              Text(
+                "Controles manuais",
+                style: GoogleFonts.inter(
+                    fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            "Configure os dispositivos do aquário",
+            style: TextStyle(
+                color: Colors.white.withOpacity(.5), fontSize: 13),
+          ),
+          const SizedBox(height: 16),
+
+          // ── ALIMENTAÇÃO IMEDIATA ──
+          _tileControleComTimestamp(
+            icone: LucideIcons.fish,
+            titulo: "Alimentar agora",
+            subtitulo: "Acionar porção imediata de ração",
+            valor: modoAlimentacao,
+            ultimaVez: ultimaAlimentacao,
+            aoMudar: (v) {
+              if (!v) return;
+              setState(() {
+                modoAlimentacao = true;
+                ultimaAlimentacao = DateTime.now();
+              });
+              mqtt.publicarAlimentacaoAgora();
+              _dbRef
+                  .child('glub1/acionamentos/alimentacao')
+                  .set(DateTime.now().millisecondsSinceEpoch);
+              Future.delayed(const Duration(seconds: 5), () {
+                if (mounted) setState(() => modoAlimentacao = false);
+              });
+            },
+          ),
+
+          const SizedBox(height: 10),
+
+          // ── TROCA IMEDIATA ──
+          _tileControleComTimestamp(
+            icone: LucideIcons.droplets,
+            titulo: "Troca de água agora",
+            subtitulo: "Acionar troca manual imediata",
+            valor: modoTrocaAgua,
+            ultimaVez: ultimaTrocaAgua,
+            aoMudar: (v) {
+              if (!v) return;
+              setState(() {
+                modoTrocaAgua = true;
+                ultimaTrocaAgua = DateTime.now();
+              });
+              mqtt.publicarTrocaAgora();
+              _dbRef
+                  .child('glub1/acionamentos/troca_agua')
+                  .set(DateTime.now().millisecondsSinceEpoch);
+              Future.delayed(const Duration(seconds: 5), () {
+                if (mounted) setState(() => modoTrocaAgua = false);
+              });
+            },
+          ),
+
+          const SizedBox(height: 10),
+
+          // NOVO: temperatura ideal
+          _tileInputNumerico(
+            icone: LucideIcons.thermometer,
+            cor: const Color(0xFF00D1FF),
+            titulo: "Temperatura ideal",
+            subtitulo: tempIdeal != null
+                ? "Ideal: ${_tempMin.toStringAsFixed(1)}°C – ${_tempMax.toStringAsFixed(1)}°C"
+                : "Usando padrão: 24°C – 28°C",
+            dica: "Ex: 26.0",
+            controller: _ctrlTempIdeal,
+            unidade: "°C",
+            valorAtual: tempIdeal?.toInt(),
+            onConfirmar: () {
+              final v = double.tryParse(_ctrlTempIdeal.text.trim());
+              if (v == null ) return;
+              setState(() => tempIdeal = v);
+              mqtt.publicarTemperatura(v);
+              _dbRef
+                .child('glub1/temperatura/set')
+                .set(v);
+            },
+          ),
+
+          const SizedBox(height: 10),
+
+          // ── ALIMENTAÇÃO: vezes por dia ──
+          _tileInputNumerico(
+            icone: LucideIcons.fish,
+            cor: const Color(0xFF00D1FF),
+            titulo: "Frequência de alimentação",
+            subtitulo: frequenciaAlimentacao != null
+                ? "$frequenciaAlimentacao× por dia"
+                : "Não configurado",
+            dica: "Vezes/dia (ex: 2)",
+            controller: _ctrlAlimentacao,
+            unidade: "×/dia",
+            valorAtual: frequenciaAlimentacao,
+            onConfirmar: () {
+              final v = int.tryParse(_ctrlAlimentacao.text.trim());
+              if (v == null || v < 1) return;
+              setState(() => frequenciaAlimentacao = v);
+              mqtt.publicarFrequenciaAlimentacao(v);
+              _dbRef
+                  .child('glub1/config/frequencia_alimentacao')
+                  .set(v);
+            },
+          ),
+
+          const SizedBox(height: 10),
+
+          // ── TROCA DE ÁGUA: vezes por mês ──
+          _tileInputNumerico(
+            icone: LucideIcons.droplets,
+            cor: const Color(0xFF00D1FF),
+            titulo: "Frequência de troca de água",
+            subtitulo: frequenciaTrocaMes != null
+                ? "$frequenciaTrocaMes× por mês"
+                : "Não configurado",
+            dica: "Vezes/mês (ex: 4)",
+            controller: _ctrlTrocaMes,
+            unidade: "×/mês",
+            valorAtual: frequenciaTrocaMes,
+            onConfirmar: () {
+              final v = int.tryParse(_ctrlTrocaMes.text.trim());
+              if (v == null || v < 1) return;
+              setState(() {
+                frequenciaTrocaMes = v;
+                mqtt.publicarFrequenciaTroca(v);
+              _dbRef
+                  .child('glub1/config/frequencia_troca_mes')
+                  .set(v);
+                final diasEntreTrocas = (30 / v).round();
+                diasParaTroca = diasEntreTrocas;
+                proximaTroca =
+                    DateTime.now().add(Duration(days: diasEntreTrocas));
+                _atualizarDatasDeNocalendario(diasEntreTrocas);
+              });
+            },
+          ),
+
+          const SizedBox(height: 10),
+
+          // ── ILUMINAÇÃO: intensidade 0-100 ──
+          _tileInputNumerico(
+            icone: LucideIcons.lightbulb,
+            cor: Colors.amberAccent,
+            titulo: "Intensidade da iluminação",
+            subtitulo: intensidadeLed != null
+                ? "$intensidadeLed% de intensidade"
+                : "Não configurado",
+            dica: "Intensidade 0–100",
+            controller: _ctrlLed,
+            unidade: "%",
+            valorAtual: intensidadeLed,
+            onConfirmar: () {
+              final v = int.tryParse(_ctrlLed.text.trim());
+              if (v == null || v < 0 || v > 100) return;
+              setState(() => intensidadeLed = v);
+              mqtt.publicarLed(v);
+              _dbRef.child('glub1/config/intensidade_led').set(v);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _tileControleComTimestamp({
+    required IconData icone,
+    required String titulo,
+    required String subtitulo,
+    required bool valor,
+    required DateTime? ultimaVez,
+    required ValueChanged<bool> aoMudar,
+  }) {
+    final corAtiva = valor ? Colors.greenAccent : const Color(0xFF00D1FF);
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: valor
+            ? Colors.greenAccent.withOpacity(.06)
+            : const Color(0xFF0A3247),
+        borderRadius: BorderRadius.circular(26),
+        border: valor
+            ? Border.all(color: Colors.greenAccent.withOpacity(.3))
+            : null,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              CircleAvatar(
+                backgroundColor: corAtiva.withOpacity(.15),
+                child: Icon(icone, color: corAtiva, size: 20),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(titulo,
+                        style:
+                            GoogleFonts.inter(fontWeight: FontWeight.w600)),
+                    Text(
+                      subtitulo,
+                      style: TextStyle(
+                          color: Colors.white.withOpacity(.5),
+                          fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+              Switch(
+                value: valor,
+                activeColor: Colors.greenAccent,
+                onChanged: aoMudar,
+              ),
+            ],
+          ),
+          if (ultimaVez != null) ...[
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const SizedBox(width: 4),
+                const Icon(LucideIcons.clock3,
+                    size: 12, color: Colors.white38),
+                const SizedBox(width: 5),
+                Text(
+                  "Último acionamento: ${_formatarDataHora(ultimaVez)}",
+                  style: const TextStyle(
+                      color: Colors.white38, fontSize: 11),
+                ),
+              ],
+            ),
+          ],
+          if (valor) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: Colors.greenAccent.withOpacity(.12),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _pulsoDot(Colors.greenAccent),
+                  const SizedBox(width: 6),
+                  Text(
+                    "Ativo — desligando em 5s",
+                    style: GoogleFonts.inter(
+                      fontSize: 11,
+                      color: Colors.greenAccent,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // TILE GENÉRICO DE INPUT NUMÉRICO
+  // ======================================================
+
+  Widget _tileInputNumerico({
+    required IconData icone,
+    required Color cor,
+    required String titulo,
+    required String subtitulo,
+    required String dica,
+    required TextEditingController controller,
+    required String unidade,
+    required int? valorAtual,
+    required VoidCallback onConfirmar,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: valorAtual != null
+            ? cor.withOpacity(.06)
+            : const Color(0xFF0A3247),
+        borderRadius: BorderRadius.circular(26),
+        border: valorAtual != null
+            ? Border.all(color: cor.withOpacity(.3))
+            : null,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              CircleAvatar(
+                backgroundColor: cor.withOpacity(.15),
+                child: Icon(icone, color: cor, size: 20),
+              ),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      titulo,
+                      style:
+                          GoogleFonts.inter(fontWeight: FontWeight.w600),
+                    ),
+                    Text(
+                      subtitulo,
+                      style: TextStyle(
+                        color: valorAtual != null
+                            ? cor.withOpacity(.8)
+                            : Colors.orangeAccent.withOpacity(.8),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  keyboardType: const TextInputType.numberWithOptions(
+                      decimal: true),
+                  style: GoogleFonts.inter(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
+                    fontSize: 15,
+                  ),
+                  decoration: InputDecoration(
+                    hintText: dica,
+                    hintStyle: TextStyle(
+                        color: Colors.white.withOpacity(.3),
+                        fontSize: 14),
+                    suffixText: unidade,
+                    suffixStyle: GoogleFonts.inter(
+                        color: cor, fontWeight: FontWeight.bold),
+                    filled: true,
+                    fillColor: const Color(0xFF031B29),
+                    contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16, vertical: 12),
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide:
+                          BorderSide(color: cor, width: 1.5),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              ElevatedButton(
+                onPressed: onConfirmar,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: cor,
+                  foregroundColor: Colors.black,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 18, vertical: 14),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  elevation: 0,
+                ),
+                child: Text(
+                  "Salvar",
+                  style:
+                      GoogleFonts.inter(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ======================================================
+  // CALENDÁRIO
+  // ======================================================
+
+  Widget _cartaoCalendario() {
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(LucideIcons.calendar, color: Color(0xFF00D1FF)),
+              const SizedBox(width: 10),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "Agenda de Manutenção",
+                    style: GoogleFonts.inter(
+                        fontSize: 20, fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    "Toque em um dia para ver ou adicionar tarefas",
+                    style: TextStyle(
+                        color: Colors.white.withOpacity(.5),
+                        fontSize: 13),
+                  ),
+                ],
+              ),
+            ],
+          ),
+          const SizedBox(height: 20),
+          TableCalendar(
+            focusedDay: _focusedDay,
+            firstDay: DateTime.utc(2024),
+            lastDay: DateTime.utc(2030),
+            selectedDayPredicate: (dia) => isSameDay(diaSelecionado, dia),
+            onDaySelected: (selecionado, focado) {
+              setState(() {
+                diaSelecionado = selecionado;
+                _focusedDay = focado;
+              });
+              _mostrarDetalhesDia(selecionado);
+            },
+            onPageChanged: (focado) {
+              setState(() => _focusedDay = focado);
+            },
+            eventLoader: (dia) {
+              final chave = DateTime.utc(dia.year, dia.month, dia.day);
+              return tarefas[chave] ?? [];
+            },
+            calendarBuilders: CalendarBuilders(
+              markerBuilder: (context, dia, eventos) {
+                if (eventos.isEmpty) return const SizedBox();
+
+                Color cor;
+                if (_todasConcluidas(dia)) {
+                  cor = Colors.greenAccent;
+                } else if (_apenasAutomaticas(dia)) {
+                  cor = const Color(0xFF00D1FF);
+                } else {
+                  cor = Colors.orange;
+                }
+
+                return Positioned(
+                  bottom: 4,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: eventos
+                        .take(3)
+                        .map((_) => Container(
+                              width: 6,
+                              height: 6,
+                              margin: const EdgeInsets.symmetric(
+                                  horizontal: 1),
+                              decoration: BoxDecoration(
+                                color: cor,
+                                shape: BoxShape.circle,
+                              ),
+                            ))
+                        .toList(),
+                  ),
+                );
+              },
+            ),
+            calendarStyle: CalendarStyle(
+              todayDecoration: BoxDecoration(
+                color: const Color(0xFF00D1FF),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              selectedDecoration: BoxDecoration(
+                color: Colors.green,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              markerDecoration: const BoxDecoration(
+                color: Colors.orange,
+                shape: BoxShape.circle,
+              ),
+            ),
+            headerStyle: const HeaderStyle(
+              formatButtonVisible: false,
+              titleCentered: true,
+            ),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              _pontoLegenda(Colors.orange, "Tarefa pendente"),
+              const SizedBox(width: 18),
+              _pontoLegenda(Colors.greenAccent, "Concluído"),
+              const SizedBox(width: 18),
+              _pontoLegenda(const Color(0xFF00D1FF), "Troca automática"),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _pontoLegenda(Color cor, String rotulo) {
+    return Row(
+      children: [
+        CircleAvatar(radius: 5, backgroundColor: cor),
+        const SizedBox(width: 6),
+        Text(rotulo,
+            style: TextStyle(
+                color: Colors.white.withOpacity(.6), fontSize: 13)),
+      ],
+    );
+  }
+
+  // ======================================================
+  // DETALHES DO DIA
+  // CORRIGIDO: novas tarefas salvas no Firebase
+  // ======================================================
+
+  void _mostrarDetalhesDia(DateTime dia) {
+    final diaNormalizado = DateTime.utc(dia.year, dia.month, dia.day);
+    final controller = TextEditingController();
+
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF08283A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      isScrollControlled: true,
+      builder: (context) {
+        return Padding(
+          padding: EdgeInsets.only(
+            left: 24,
+            right: 24,
+            top: 24,
+            bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+          ),
+          child: StatefulBuilder(
+            builder: (context, modalSetState) {
+              final tarefasDia = tarefas[diaNormalizado] ?? [];
+
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 40,
+                      height: 4,
+                      margin: const EdgeInsets.only(bottom: 20),
+                      decoration: BoxDecoration(
+                        color: Colors.white24,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    ),
+                  ),
+                  Text(
+                    "Detalhes do Dia",
+                    style: GoogleFonts.inter(
+                        fontSize: 26, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    "${dia.day}/${dia.month}/${dia.year}",
+                    style: TextStyle(
+                        color: Colors.white.withOpacity(.6)),
+                  ),
+                  const SizedBox(height: 24),
+
+                  if (tarefasDia.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 16),
+                      child: Text(
+                        "Nenhuma tarefa para este dia.",
+                        style: TextStyle(
+                            color: Colors.white.withOpacity(.4),
+                            fontSize: 14),
+                      ),
+                    ),
+
+                  ...tarefasDia.asMap().entries.map((entry) {
+                    final tarefa = entry.value;
+                    final isAutomatica =
+                        tarefa.nome == "Troca de água (automática)";
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 14),
+                      decoration: BoxDecoration(
+                        color: tarefa.concluida
+                            ? Colors.greenAccent.withOpacity(.08)
+                            : isAutomatica
+                                ? const Color(0xFF00D1FF).withOpacity(.06)
+                                : const Color(0xFF0A3247),
+                        borderRadius: BorderRadius.circular(16),
+                        border: tarefa.concluida
+                            ? Border.all(
+                                color: Colors.greenAccent
+                                    .withOpacity(.3))
+                            : isAutomatica
+                                ? Border.all(
+                                    color: const Color(0xFF00D1FF)
+                                        .withOpacity(.25))
+                                : null,
+                      ),
+                      child: Row(
+                        children: [
+                          GestureDetector(
+                            onTap: () {
+                              modalSetState(() {
+                                tarefa.concluida = !tarefa.concluida;
+                              });
+                              setState(() {});
+                              _salvarTarefasConcluidas(dia);
+                              // NOVO: se for tarefa do usuário, atualiza status
+                              if (tarefa.isUsuario) {
+                                _salvarTarefasUsuario(dia);
+                              }
+                            },
+                            child: AnimatedContainer(
+                              duration:
+                                  const Duration(milliseconds: 200),
+                              width: 26,
+                              height: 26,
+                              decoration: BoxDecoration(
+                                color: tarefa.concluida
+                                    ? Colors.greenAccent
+                                    : Colors.transparent,
+                                borderRadius:
+                                    BorderRadius.circular(8),
+                                border: Border.all(
+                                  color: tarefa.concluida
+                                      ? Colors.greenAccent
+                                      : Colors.white38,
+                                  width: 2,
+                                ),
+                              ),
+                              child: tarefa.concluida
+                                  ? const Icon(Icons.check,
+                                      size: 16, color: Colors.black)
+                                  : null,
+                            ),
+                          ),
+                          const SizedBox(width: 14),
+                          Expanded(
+                            child: Row(
+                              children: [
+                                if (isAutomatica) ...[
+                                  const Icon(LucideIcons.droplets,
+                                      size: 14,
+                                      color: Color(0xFF00D1FF)),
+                                  const SizedBox(width: 6),
+                                ],
+                                // NOVO: ícone para tarefas do usuário
+                                if (tarefa.isUsuario &&
+                                    !isAutomatica) ...[
+                                  Icon(LucideIcons.userCheck,
+                                      size: 14,
+                                      color: Colors.white38),
+                                  const SizedBox(width: 6),
+                                ],
+                                Expanded(
+                                  child: Text(
+                                    tarefa.nome,
+                                    style: GoogleFonts.inter(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.w500,
+                                      color: tarefa.concluida
+                                          ? Colors.white38
+                                          : isAutomatica
+                                              ? const Color(0xFF00D1FF)
+                                              : Colors.white,
+                                      decoration: tarefa.concluida
+                                          ? TextDecoration.lineThrough
+                                          : null,
+                                      decorationColor: Colors.white38,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          if (tarefa.concluida)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: Colors.greenAccent
+                                    .withOpacity(.15),
+                                borderRadius:
+                                    BorderRadius.circular(8),
+                              ),
+                              child: Text(
+                                "Concluída",
+                                style: GoogleFonts.inter(
+                                  fontSize: 11,
+                                  color: Colors.greenAccent,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    );
+                  }),
+
+                  const SizedBox(height: 8),
+                  TextField(
+                    controller: controller,
+                    decoration: InputDecoration(
+                      hintText: "Adicionar nova tarefa...",
+                      filled: true,
+                      fillColor: const Color(0xFF0B3247),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(18),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00D1FF),
+                        foregroundColor: Colors.black,
+                        padding:
+                            const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                      ),
+                      onPressed: () {
+                        if (controller.text.trim().isEmpty) return;
+                        final novaTarefa = TarefaCalendario(
+                          nome: controller.text.trim(),
+                          isUsuario: true, // NOVO: marca como tarefa do usuário
+                        );
+                        setState(() {
+                          tarefas.putIfAbsent(diaNormalizado, () => []);
+                          tarefas[diaNormalizado]!.add(novaTarefa);
+                        });
+                        // NOVO: persiste no Firebase imediatamente
+                        _salvarTarefasUsuario(dia);
+                        Navigator.pop(context);
+                      },
+                      icon: const Icon(Icons.add),
+                      label: const Text("Adicionar tarefa"),
+                    ),
+                  ),
+                ],
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+}
+
+// ======================================================
+// ENUM DE ESTADO DE VOLTAGEM
+// ======================================================
+
+enum _EstadoVoltagem { tomada, bateria, critico, desconectado }
+
+// ======================================================
+// COMPONENTE CUSTOMIZADO: CARTÃO SENSOR (temperatura intraday)
+// CORRIGIDO: padding nas bordas do gráfico
+// ======================================================
+
+class CartaoSensor extends StatelessWidget {
+  final String titulo;
+  final String valor;
+  final String unidade;
+  final String subtitulo;
+  final IconData icone;
+  final List<LeituraTemp> historicoTemp;
+
+  const CartaoSensor({
+    super.key,
+    required this.titulo,
+    required this.valor,
+    required this.unidade,
+    required this.subtitulo,
+    required this.icone,
+    required this.historicoTemp,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // CORRIGIDO: calcular min/max com padding de 0.5°C
+    double minY = 23.0;
+    double maxY = 29.0;
+    if (historicoTemp.isNotEmpty) {
+      final valores = historicoTemp.map((e) => e.valor).toList();
+      final minV = valores.reduce((a, b) => a < b ? a : b);
+      final maxV = valores.reduce((a, b) => a > b ? a : b);
+      minY = (minV - 0.5);
+      maxY = (maxV + 0.5);
+      if ((maxY - minY) < 1.0) {
+        minY -= 0.5;
+        maxY += 0.5;
+      }
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(22),
+      decoration: cardDecoration(),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icone, color: const Color(0xFF00D1FF)),
+              const SizedBox(width: 10),
+              Text(
+                titulo,
+                style: GoogleFonts.inter(
+                    fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            "Leituras das últimas horas (intervalo: 20 min)",
+            style: TextStyle(
+                color: Colors.white.withOpacity(.5), fontSize: 13),
+          ),
+          const SizedBox(height: 24),
+          SizedBox(
+            height: 200,
+            child: historicoTemp.isEmpty
+                ? Center(
+                    child: Text(
+                      "Aguardando dados do sensor...",
+                      style: TextStyle(
+                          color: Colors.white.withOpacity(.4)),
+                    ),
+                  )
+                : LineChart(
+                    LineChartData(
+                      gridData: const FlGridData(show: false),
+                      titlesData: FlTitlesData(
+                        leftTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        topTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        rightTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        bottomTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 22,
+                            interval: 1,
+                            getTitlesWidget: (value, meta) {
+                              int idx = value.toInt();
+                              if (idx >= 0 &&
+                                  idx < historicoTemp.length) {
+                                bool mostrar = false;
+                                if (historicoTemp.length <= 4) {
+                                  mostrar = true;
+                                } else {
+                                  int meio =
+                                      (historicoTemp.length / 2).floor();
+                                  if (idx == 0 ||
+                                      idx == meio ||
+                                      idx == historicoTemp.length - 1) {
+                                    mostrar = true;
+                                  }
+                                }
+                                if (mostrar) {
+                                  final DateTime horario =
+                                      historicoTemp[idx].horario;
+                                  return Padding(
+                                    padding:
+                                        const EdgeInsets.only(top: 6),
+                                    child: Text(
+                                      '${horario.hour.toString().padLeft(2, '0')}:${horario.minute.toString().padLeft(2, '0')}',
+                                      style: const TextStyle(
+                                        color: Colors.white38,
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                  );
+                                }
+                              }
+                              return const SizedBox();
+                            },
+                          ),
+                        ),
+                      ),
+                      borderData: FlBorderData(show: false),
+                      minX: 0,
+                      maxX: (historicoTemp.length - 1).toDouble(),
+                      minY: minY,
+                      maxY: maxY,
+                      lineBarsData: [
+                        LineChartBarData(
+                          spots: historicoTemp
+                              .asMap()
+                              .entries
+                              .map((e) => FlSpot(
+                                  e.key.toDouble(), e.value.valor))
+                              .toList(),
+                          isCurved: true,
+                          color: const Color(0xFF00D1FF),
+                          barWidth: 3,
+                          isStrokeCapRound: true,
+                          dotData: const FlDotData(show: true),
+                          belowBarData: BarAreaData(
+                            show: true,
+                            color:
+                                const Color(0xFF00D1FF).withOpacity(0.1),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ======================================================
+// DECORAÇÕES
+// ======================================================
+
+BoxDecoration cardDecoration() {
+  return BoxDecoration(
+    color: const Color(0xFF062436),
+    borderRadius: BorderRadius.circular(28),
+    border: Border.all(color: Colors.white.withOpacity(.05)),
+  );
+}
+
+BoxDecoration innerDecoration() {
+  return BoxDecoration(
+    color: const Color(0xFF0A3247),
+    borderRadius: BorderRadius.circular(26),
+  );
+}
